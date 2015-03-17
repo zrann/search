@@ -1,0 +1,3812 @@
+package searching;
+
+import java.io.BufferedReader;
+import java.io.BufferedWriter;
+import java.io.DataInputStream;
+import java.io.EOFException;
+import java.io.File;
+import java.io.FileInputStream;
+import java.io.FileNotFoundException;
+import java.io.FileReader;
+import java.io.FileWriter;
+import java.io.IOException;
+import java.io.StringReader;
+import java.text.SimpleDateFormat;
+import java.util.ArrayList;
+import java.util.Calendar;
+import java.util.Collections;
+import java.util.Comparator;
+import java.util.Date;
+import java.util.HashMap;
+import java.util.Iterator;
+import java.util.List;
+import java.util.Map;
+import java.util.StringTokenizer;
+import java.util.Vector;
+import java.util.zip.DataFormatException;
+import java.util.zip.Inflater;
+
+import org.apache.lucene.analysis.Analyzer;
+import org.apache.lucene.analysis.TokenStream;
+import org.apache.lucene.analysis.tokenattributes.TermAttribute;
+import org.apache.lucene.document.Document;
+import org.apache.lucene.document.Field;
+import org.apache.lucene.document.Field.Store;
+import org.apache.lucene.document.Field.TermVector;
+import org.apache.lucene.index.CorruptIndexException;
+import org.apache.lucene.index.Term;
+import org.apache.lucene.search.BooleanClause;
+import org.apache.lucene.search.BooleanQuery;
+import org.apache.lucene.search.IndexSearcher;
+import org.apache.lucene.search.Query;
+import org.apache.lucene.search.ScoreDoc;
+import org.apache.lucene.search.TermQuery;
+import org.apache.lucene.search.TopDocs;
+import org.apache.lucene.search.highlight.Fragmenter;
+import org.apache.lucene.search.highlight.Highlighter;
+import org.apache.lucene.search.highlight.QueryScorer;
+import org.apache.lucene.search.highlight.SimpleSpanFragmenter;
+import org.apache.lucene.search.highlight.TextFragment;
+import org.apache.lucene.store.Directory;
+import org.apache.lucene.store.FSDirectory;
+import org.apache.lucene.store.IndexInput;
+import org.wltea.analyzer.lucene.IKTokenizer;
+
+import preprocess.SortByFrequency;
+import preprocess.SortByFrequencyCostSize;
+import preprocess.SortByFrequencySize;
+import ssd.SSD;
+import ssd.SSDForSnippet;
+import util.Configure;
+import util.RAMEstimator;
+import cache.Cache;
+import cache.CacheNode;
+import cache.CacheStrategy;
+import cache.CacheUtils;
+import cache.DynCA;
+import cache.DynFB;
+import cache.DynQTFDF;
+import cache.LFU;
+import cache.LRU;
+import cache.StaticCache;
+import entity.CompressedDocument;
+import entity.CompressedRLZ;
+import entity.Snippet;
+import entity.Frag;
+
+public class Search {
+	private Analyzer analyzer = null;
+	private Directory indexDirectory = null;
+	private IndexSearcher searcher = null;
+	
+	//usedf for RLZ
+	private byte[] RLZDirectiory = null;
+//	HashMap <Integer,Integer> DocumentContentLength=new HashMap<Integer,Integer>();
+	byte[] tc=new byte[3*1024*1024];
+	byte[] filecontent = new byte[3*1024*1024];
+	byte[] buffer = new byte[3*1024*1024];
+	byte[] titleContent = new byte[1024*1024];
+	byte[] urlContent = new byte[1024*1024];
+	// record all the document cache missed docID
+	StringBuffer MissedDocID=new StringBuffer();
+	StringBuffer HitedDoID=new StringBuffer();
+	boolean isTrain=true;
+	
+//	public static BufferedWriter queryDocIDWriter = null;
+	public static String currentQueryStr = "";
+	
+	public static OutputMeasurement outputMeasurement = new OutputMeasurement();
+	public static InputParameters inputParameters = new InputParameters();
+	
+	// the following two variables are used for calculating the 
+	// average length of posting list per hit
+	public static double totalPostingListHitLength = 0.0f;
+	public static int totalNumOfPostingListHit = 0;
+	
+//	public static Vector<String> hitStringVector = new Vector<String>();
+//
+//	// used for statistics of accessed documents and snippets
+//	public static HashMap<Integer, Integer> docHitMap = new HashMap<Integer, Integer> ();
+//	public static HashMap<String, Integer> snipHitMap = new HashMap<String, Integer>();
+	
+	/**
+	 * Although the keys are different for resultCache, postingCache, documentCache and snippetCache
+	 * they can be the same by making signatures for the original keys
+	 * but due to the conflicts may be involved, have to explicitly handle the conflicts
+	 * For simplicity, we do not implement in that way.
+	 * Another thing is that, the entry e.g., Integer, takes at least 8 bytes rather than 4 bytes
+	 * so, because this is specific to Java, it is unfair to measure the RAM usage like that
+	 * Instead, each Integer type is measured as normal int type, which takes 4 bytes
+	 */
+	
+	// query result cache
+	// key can be the signature of the query, rather than the query directly
+	// to minimize space consumption
+	// value is top-k result document IDs
+	Cache<Query, List<Snippet>> resultCache = null;
+	
+	// posting list cache
+	// key can be the signature of the term
+	// value is a list of posting entries	
+	// but, in Lucene's implementation, it is an instance of IndexInput
+	
+	// NOTE: here, the index must use writer.optimize()
+	// otherwise, there will be many segments
+	// cache should be Cache<Term, Vector<IndexInput>>
+	// Vector.elementAt(i) is the posting list over the i-th segment
+	public static Cache<Term, IndexInput> postingCache = null;
+	
+	// document cache
+	// key is the document ID
+	// value is the Document class in Lucene
+	Cache<Integer, Document> documentCache = null;
+	
+	// RLZ compressed document cache
+	// key is the document ID
+	// value is the RLZ compressed document 
+	Cache<Integer, CompressedDocument> RLZDocumentCache = null;
+	
+	// compressed RLZ document cache
+	// key is the document ID
+	// value is the RLZ compressed document 
+	Cache<Integer, CompressedRLZ> CRLZDocumentCache = null;
+	
+	// snippet cache
+	// key is the signature of query + docID
+	// query + docID
+	Cache<String, Snippet> snippetCache = null;
+	
+	// frag cache
+	// key is the signature of query + docID
+	// query + docID
+	Cache<String, Frag> fragCache = null;
+	SSD ssd=new SSD();
+	SSDForSnippet ssdForSnippet=new SSDForSnippet();
+	
+	// next, we maintain a priority queue for every type of cache
+	// for getting the historical usage info in the static cache
+//	ExternalHashMap<CacheNode<Query, List<Integer>>, Boolean> resultCachePriorityQ = null;
+//	ExternalHashMap<CacheNode<Term, IndexInput>, Boolean> postingCachePriorityQ = null;
+//	ExternalHashMap<CacheNode<Integer, Document>, Boolean> documentCachePriorityQ = null;
+//	ExternalHashMap<CacheNode<String, Snippet>, Boolean> snippetCachePriorityQ = null;
+	
+	// constructor
+	public Search(InputParameters inputParameters){
+		this.initialize(inputParameters);
+	}
+	
+	//used for RLZ
+	byte[] loadDictionary(String path) throws IOException{
+	//	String d=new String();
+		
+		/*BufferedReader reader = new BufferedReader(new FileReader(new File (path)));		
+		// read RLZ dictionary (string) from disk/SSD\
+		char[] cbuf=new char[512*1024*1024+1];
+		int a=reader.read(cbuf, 0, 512*1024*1024);
+		d=new String(cbuf,0,512*1024*1024);
+		*/
+		File file1 = new File(path);  
+	    Long filelength = file1.length();  
+	    System.out.println(filelength.intValue());
+        byte[] filecontent = new byte[filelength.intValue()];  
+	    FileInputStream in = new FileInputStream(file1);  
+	    in.read(filecontent);  
+        in.close();  
+ //     d= new String(filecontent);  
+        
+		/*String name="RLZDictionary"+".txt";
+		File text=new File("D:\\RLZ\\",name);
+		if(text.exists()){text.delete();}
+		try {
+			text.createNewFile();
+		} catch (IOException e) {
+			// TODO Auto-generated catch block
+			e.printStackTrace();
+		}
+		FileWriter fw;
+		try {
+			fw = new FileWriter(text,true);
+			fw.append(d);
+		    fw.close();
+		} catch (IOException e) {
+			// TODO Auto-generated catch block
+			e.printStackTrace();
+		}		
+		System.out.println(d.length());*/
+		return filecontent;
+	}
+	/*void loadDocumentContentLength() throws IOException{
+		BufferedReader reader = new BufferedReader(new FileReader(new File ("D:\\RLZ\\dict256MOutput\\originalFileLen")));
+		String line = "";
+		while (true) {
+			line = reader.readLine();
+			if (line == null)	break;
+			
+			StringTokenizer tokenizer; 
+			tokenizer = new StringTokenizer(line, " ");
+			Vector<String> tempStrVec = new Vector<String>();
+			
+			while (tokenizer.hasMoreTokens()) {
+				tempStrVec.add(tokenizer.nextToken()); 
+			}
+			
+		//	if (tempStrVec.size() != 2)	continue;
+			
+		//	if(tempStrVec.size()==2){
+				this.DocumentContentLength.put(Integer.parseInt(tempStrVec.elementAt(0)), Integer.parseInt(tempStrVec.elementAt(1)));				
+		//	}				
+			
+			outputMeasurement.numOfQueries ++;
+			tokenizer=null;
+			tempStrVec=null;
+			
+		}
+	//	printOutContentLength();
+	}*/
+	
+	private void initialize(InputParameters inputParameters){
+		try {
+			this.inputParameters = inputParameters;
+			this.analyzer = Configure.SOUGOU_ANALYZER;
+			indexDirectory = FSDirectory.open(new File (inputParameters.indexPath));
+			searcher = new IndexSearcher(indexDirectory, true); // read-only=true
+			
+			//usde for RLZ
+			if(Configure.RLZ)this.RLZDirectiory = this.loadDictionary(inputParameters.RLZDictionaryPath);
+	//		loadDocumentContentLength();
+			this.initializeCacheInfo();
+		} catch (IOException e) {
+			// TODO Auto-generated catch block
+			e.printStackTrace();
+		}
+	}
+	
+	// initialize the cache associated information
+	private void initializeCacheInfo(){
+		if (inputParameters.memoryLimitMB() > 0 && inputParameters.resultCacheTurnOn){
+
+			if (inputParameters.cacheStrategy_QRC.equalsIgnoreCase(CacheStrategy.LRU))
+				resultCache = new LRU<Query, List<Snippet>>(inputParameters.memoryLimitMB_QRC);
+			else if (inputParameters.cacheStrategy_QRC.equalsIgnoreCase(CacheStrategy.LFU))
+				resultCache = new LFU<Query, List<Snippet>>(inputParameters.memoryLimitMB_QRC);
+			else if (inputParameters.cacheStrategy_QRC.equalsIgnoreCase(CacheStrategy.DynQTFDF))
+				resultCache = new DynQTFDF<Query, List<Snippet>>(inputParameters.memoryLimitMB_QRC);
+			else if (inputParameters.cacheStrategy_QRC.equalsIgnoreCase(CacheStrategy.DynCA))
+				resultCache = new DynCA<Query, List<Snippet>>(inputParameters.memoryLimitMB_QRC);
+			else if (inputParameters.cacheStrategy_QRC.equalsIgnoreCase(CacheStrategy.DynFB))
+				resultCache = new DynFB<Query, List<Snippet>>(inputParameters.memoryLimitMB_QRC);
+			else if (inputParameters.cacheStrategy_QRC.equalsIgnoreCase(CacheStrategy.StaQTF)){
+				resultCache = new StaticCache<Query, List<Snippet>>(inputParameters.memoryLimitMB_QRC);
+			} else if (inputParameters.cacheStrategy_QRC.equalsIgnoreCase(CacheStrategy.StaQTFDF)){
+				resultCache = new StaticCache<Query, List<Snippet>>(inputParameters.memoryLimitMB_QRC);
+			} else if (inputParameters.cacheStrategy_QRC.equalsIgnoreCase(CacheStrategy.StaCA)){
+				resultCache = new StaticCache<Query, List<Snippet>>(inputParameters.memoryLimitMB_QRC);
+			} else {
+				System.out.println("wrong result cache type specified !");
+				System.out.println(inputParameters.cacheStrategy_QRC);
+				System.exit(0);
+			}
+		}
+		
+		if (inputParameters.memoryLimitMB() > 0 && inputParameters.postingListCacheTurnOn){
+			
+			if (inputParameters.cacheStrategy_PLC.equalsIgnoreCase(CacheStrategy.LRU))
+				postingCache = new LRU<Term, IndexInput>(inputParameters.memoryLimitMB_PLC);
+			else if (inputParameters.cacheStrategy_PLC.equalsIgnoreCase(CacheStrategy.LFU))
+				postingCache = new LFU<Term, IndexInput>(inputParameters.memoryLimitMB_PLC);
+			else if (inputParameters.cacheStrategy_PLC.equalsIgnoreCase(CacheStrategy.DynQTFDF))
+				postingCache = new DynQTFDF<Term, IndexInput>(inputParameters.memoryLimitMB_PLC);
+			else if (inputParameters.cacheStrategy_PLC.equalsIgnoreCase(CacheStrategy.DynCA))
+				postingCache = new DynCA<Term, IndexInput>(inputParameters.memoryLimitMB_PLC);
+			else if (inputParameters.cacheStrategy_PLC.equalsIgnoreCase(CacheStrategy.StaQTF)){
+				postingCache = new StaticCache<Term, IndexInput>(inputParameters.memoryLimitMB_PLC);
+			} else if (inputParameters.cacheStrategy_PLC.equalsIgnoreCase(CacheStrategy.StaQTFDF)){
+				postingCache = new StaticCache<Term, IndexInput>(inputParameters.memoryLimitMB_PLC);
+			} else if (inputParameters.cacheStrategy_PLC.equalsIgnoreCase(CacheStrategy.StaCA)){
+				postingCache = new StaticCache<Term, IndexInput>(inputParameters.memoryLimitMB_PLC);
+			} else {
+				System.out.println("wrong posting list cache type specified !");
+				System.exit(0);
+			}
+		}
+		
+		if (inputParameters.memoryLimitMB() > 0 && inputParameters.documentCacheTurnOn){
+			if (inputParameters.cacheStrategy_DC.equalsIgnoreCase(CacheStrategy.LRU))
+				documentCache = new LRU<Integer, Document>(inputParameters.memoryLimitMB_DC);
+			else if (inputParameters.cacheStrategy_DC.equalsIgnoreCase(CacheStrategy.LFU))
+				documentCache = new LFU<Integer, Document>(inputParameters.memoryLimitMB_DC);
+			else if (inputParameters.cacheStrategy_DC.equalsIgnoreCase(CacheStrategy.DynQTFDF))
+				documentCache = new DynQTFDF<Integer, Document>(inputParameters.memoryLimitMB_DC);
+			else if (inputParameters.cacheStrategy_DC.equalsIgnoreCase(CacheStrategy.DynCA))
+				documentCache = new DynCA<Integer, Document>(inputParameters.memoryLimitMB_DC);
+			else if (inputParameters.cacheStrategy_DC.equalsIgnoreCase(CacheStrategy.StaQTF)){
+				documentCache = new StaticCache<Integer, Document>(inputParameters.memoryLimitMB_DC);
+			} else if (inputParameters.cacheStrategy_DC.equalsIgnoreCase(CacheStrategy.StaQTFDF)){
+				documentCache = new StaticCache<Integer, Document>(inputParameters.memoryLimitMB_DC);
+			} else if (inputParameters.cacheStrategy_DC.equalsIgnoreCase(CacheStrategy.StaCA)){
+				documentCache = new StaticCache<Integer, Document>(inputParameters.memoryLimitMB_DC);
+			} else {
+				System.out.println("wrong document cache type specified !");
+				System.exit(0);
+			}
+		}
+		
+		if (inputParameters.memoryLimitMB() > 0 && inputParameters.RLZDocumentCacheTurnOn){
+			if (inputParameters.cacheStrategy_RLZDC.equalsIgnoreCase(CacheStrategy.LRU))
+				RLZDocumentCache = new LRU<Integer, CompressedDocument>(inputParameters.memoryLimitMB_RLZDC);
+			else if (inputParameters.cacheStrategy_RLZDC.equalsIgnoreCase(CacheStrategy.LFU))
+				RLZDocumentCache = new LFU<Integer, CompressedDocument>(inputParameters.memoryLimitMB_RLZDC);
+			else if (inputParameters.cacheStrategy_RLZDC.equalsIgnoreCase(CacheStrategy.DynQTFDF))
+				RLZDocumentCache = new DynQTFDF<Integer, CompressedDocument>(inputParameters.memoryLimitMB_RLZDC);
+			else if (inputParameters.cacheStrategy_RLZDC.equalsIgnoreCase(CacheStrategy.DynCA))
+				RLZDocumentCache = new DynCA<Integer, CompressedDocument>(inputParameters.memoryLimitMB_RLZDC);
+			else if (inputParameters.cacheStrategy_RLZDC.equalsIgnoreCase(CacheStrategy.StaQTF)){
+				RLZDocumentCache = new StaticCache<Integer, CompressedDocument>(inputParameters.memoryLimitMB_RLZDC);
+			} else if (inputParameters.cacheStrategy_RLZDC.equalsIgnoreCase(CacheStrategy.StaQTFDF)){
+				RLZDocumentCache = new StaticCache<Integer, CompressedDocument>(inputParameters.memoryLimitMB_RLZDC);
+			} else if (inputParameters.cacheStrategy_RLZDC.equalsIgnoreCase(CacheStrategy.StaCA)){
+				RLZDocumentCache = new StaticCache<Integer, CompressedDocument>(inputParameters.memoryLimitMB_RLZDC);
+			} else {
+				System.out.println("wrong RLZDocument cache type specified !");
+				System.exit(0);
+			}
+		}
+		
+		if (inputParameters.memoryLimitMB() > 0 && inputParameters.CRLZDocumentCacheTurnOn){
+			if (inputParameters.cacheStrategy_CRLZDC.equalsIgnoreCase(CacheStrategy.LRU))
+				CRLZDocumentCache = new LRU<Integer, CompressedRLZ>(inputParameters.memoryLimitMB_CRLZDC);
+			else if (inputParameters.cacheStrategy_CRLZDC.equalsIgnoreCase(CacheStrategy.LFU))
+				CRLZDocumentCache = new LFU<Integer, CompressedRLZ>(inputParameters.memoryLimitMB_CRLZDC);
+			else if (inputParameters.cacheStrategy_CRLZDC.equalsIgnoreCase(CacheStrategy.DynQTFDF))
+				CRLZDocumentCache = new DynQTFDF<Integer, CompressedRLZ>(inputParameters.memoryLimitMB_CRLZDC);
+			else if (inputParameters.cacheStrategy_CRLZDC.equalsIgnoreCase(CacheStrategy.DynCA))
+				CRLZDocumentCache = new DynCA<Integer, CompressedRLZ>(inputParameters.memoryLimitMB_CRLZDC);
+			else if (inputParameters.cacheStrategy_CRLZDC.equalsIgnoreCase(CacheStrategy.StaQTF)){
+				CRLZDocumentCache = new StaticCache<Integer, CompressedRLZ>(inputParameters.memoryLimitMB_CRLZDC);
+			} else if (inputParameters.cacheStrategy_CRLZDC.equalsIgnoreCase(CacheStrategy.StaQTFDF)){
+				CRLZDocumentCache = new StaticCache<Integer, CompressedRLZ>(inputParameters.memoryLimitMB_CRLZDC);
+			} else if (inputParameters.cacheStrategy_CRLZDC.equalsIgnoreCase(CacheStrategy.StaCA)){
+				CRLZDocumentCache = new StaticCache<Integer, CompressedRLZ>(inputParameters.memoryLimitMB_CRLZDC);
+			} else {
+				System.out.println("wrong CRLZDocument cache type specified !");
+				System.exit(0);
+			}
+		}
+		
+		
+		if (inputParameters.memoryLimitMB() > 0 && inputParameters.snippetCacheTurnOn){
+			if (inputParameters.cacheStrategy_SC.equalsIgnoreCase(CacheStrategy.LRU))
+				snippetCache = new LRU<String, Snippet>(inputParameters.memoryLimitMB_SC);
+			else if (inputParameters.cacheStrategy_SC.equalsIgnoreCase(CacheStrategy.LFU))
+				snippetCache = new LFU<String, Snippet>(inputParameters.memoryLimitMB_SC);
+			else if (inputParameters.cacheStrategy_SC.equalsIgnoreCase(CacheStrategy.DynQTFDF))
+				snippetCache = new DynQTFDF<String, Snippet>(inputParameters.memoryLimitMB_SC);
+			else if (inputParameters.cacheStrategy_SC.equalsIgnoreCase(CacheStrategy.DynCA))
+				snippetCache = new DynCA<String, Snippet>(inputParameters.memoryLimitMB_SC);
+			else if (inputParameters.cacheStrategy_SC.equalsIgnoreCase(CacheStrategy.StaQTF)){
+				snippetCache = new StaticCache<String, Snippet>(inputParameters.memoryLimitMB_SC);
+			} else if (inputParameters.cacheStrategy_SC.equalsIgnoreCase(CacheStrategy.StaQTFDF)){
+				snippetCache = new StaticCache<String, Snippet>(inputParameters.memoryLimitMB_SC);
+			} else if (inputParameters.cacheStrategy_SC.equalsIgnoreCase(CacheStrategy.StaCA)){
+				snippetCache = new StaticCache<String, Snippet>(inputParameters.memoryLimitMB_SC);
+			} else {
+				System.out.println("wrong snippet cache type specified !");
+				System.exit(0);
+			}
+		}
+		if (inputParameters.memoryLimitMB() > 0 && inputParameters.fragCacheTurnOn){
+			if(inputParameters.cacheStrategy_FC.equalsIgnoreCase(CacheStrategy.LRU))
+				fragCache = new LRU<String, Frag>(inputParameters.memoryLimitMB_FC);
+			else if (inputParameters.cacheStrategy_FC.equalsIgnoreCase(CacheStrategy.LFU))
+				fragCache = new LFU<String, Frag>(inputParameters.memoryLimitMB_FC);
+			else if (inputParameters.cacheStrategy_FC.equalsIgnoreCase(CacheStrategy.DynQTFDF))
+				fragCache = new DynQTFDF<String, Frag>(inputParameters.memoryLimitMB_FC);
+			else if (inputParameters.cacheStrategy_FC.equalsIgnoreCase(CacheStrategy.DynCA))
+				fragCache = new DynCA<String, Frag>(inputParameters.memoryLimitMB_FC);
+			else if (inputParameters.cacheStrategy_FC.equalsIgnoreCase(CacheStrategy.StaQTF)){
+				fragCache = new StaticCache<String, Frag>(inputParameters.memoryLimitMB_FC);
+			} else if (inputParameters.cacheStrategy_FC.equalsIgnoreCase(CacheStrategy.StaQTFDF)){
+				fragCache = new StaticCache<String, Frag>(inputParameters.memoryLimitMB_FC);
+			} else if (inputParameters.cacheStrategy_FC.equalsIgnoreCase(CacheStrategy.StaCA)){
+				fragCache = new StaticCache<String, Frag>(inputParameters.memoryLimitMB_FC);
+		    } else {
+		    	System.out.println("wrong frag cache type specified !");
+		    	System.exit(0);
+		    }
+		}
+	}
+	
+	// close the posting list cache
+	private void closePostingListCache(){
+		if (this.postingCache == null)	return;
+		HashMap<Term, CacheNode<Term,IndexInput>> postingContent = this.postingCache.getCacheContent();
+		ArrayList<CacheNode> arrayList = new ArrayList<CacheNode>(postingContent.values());
+		for (int i = arrayList.size() - 1; i >= 0; i --){
+			CacheNode<Term,IndexInput> tempNode = arrayList.get(i);
+			if (tempNode != null){
+				IndexInput indexInput = (IndexInput)tempNode.value;
+				if (indexInput != null){
+					try {
+						indexInput.close();
+					} catch (IOException e) {
+						e.printStackTrace();
+					}
+				}
+			}
+		}
+		this.postingCache = null;
+	}
+	
+	private void reset(){
+		this.outputMeasurement.reset();
+		resultCache = null;
+		// close the index input streams in the posting list cache first
+		closePostingListCache();
+		documentCache = null;
+		RLZDocumentCache = null;
+		CRLZDocumentCache = null;
+		snippetCache = null;
+		fragCache = null;
+	}
+	
+	private void closeSearch(){
+		try {
+			this.searcher.close();
+			this.reset();
+		} catch (IOException e) {
+			// TODO Auto-generated catch block
+			e.printStackTrace();
+		}
+	}
+	
+	// for output
+	// the file name depends on input parameters
+	private String generateOutpuFileName(){
+		
+		StringBuilder strBuilder = new StringBuilder();
+		
+//		String cacheType = "";
+//		if (inputParameters.resultCacheTurnOn)	cacheType += "QRC";
+//		if (inputParameters.postingListCacheTurnOn) cacheType += "PLC";
+//		if (inputParameters.documentCacheTurnOn)	cacheType += "DC";
+//		if (inputParameters.snippetCacheTurnOn)	cacheType += "SC";
+		
+		String cacheStrategy = inputParameters.getCacheStrategyForFileName();
+
+		String SSDHDD = inputParameters.isSSD()? "SSD": "HDD";
+		
+		String func = "FC Standard ";
+//		strBuilder.append(cacheType + "-");
+		strBuilder.append(func + "-");
+		strBuilder.append(cacheStrategy + "-");
+		strBuilder.append(SSDHDD + ".txt");
+		
+		return strBuilder.toString();
+	
+	}
+	
+	private void printOutputInfo(){
+		// first of all, generate the file name, then output
+		String fileName = generateOutpuFileName();
+		fileName = Configure.outputFileDirectory + fileName;
+		System.out.println("file name: " + fileName);
+		try{
+			BufferedWriter writer = new BufferedWriter(new FileWriter(new File (fileName)));
+			String inputInfo = this.inputParameters.toString();
+			String outputInfo = this.outputMeasurement.toString();
+			
+			writer.write(inputInfo + "\n");
+			writer.write(outputInfo);
+			writer.close();
+		}catch(Exception e){
+			e.printStackTrace();
+		}
+	}
+	
+	private void resetCacheStatistics(){
+		if (inputParameters.memoryLimitMB() > 0 && inputParameters.resultCacheTurnOn)
+			this.resultCache.reset();
+	
+		if (inputParameters.memoryLimitMB() > 0 && inputParameters.postingListCacheTurnOn)
+			this.postingCache.reset();
+	
+		if (inputParameters.memoryLimitMB() > 0 && inputParameters.documentCacheTurnOn)
+			this.documentCache.reset();
+		
+		if (inputParameters.memoryLimitMB() > 0 && inputParameters.RLZDocumentCacheTurnOn)
+			this.RLZDocumentCache.reset();
+		
+		if (inputParameters.memoryLimitMB() > 0 && inputParameters.CRLZDocumentCacheTurnOn)
+			this.CRLZDocumentCache.reset();
+	
+		if (inputParameters.memoryLimitMB() > 0 && inputParameters.snippetCacheTurnOn)
+			this.snippetCache.reset();
+		
+		if (inputParameters.memoryLimitMB() > 0 && inputParameters.fragCacheTurnOn)
+			this.fragCache.reset();
+		
+		this.outputMeasurement.reset();
+//		this.hitStringVector.clear();
+	}
+	
+
+	public static String getCurrentTime(){
+		Date   date   =   Calendar.getInstance().getTime(); 
+        SimpleDateFormat   sdf   =   new   SimpleDateFormat( "yyyy/MM/dd HH:mm:ss"); 
+        String   sDate   =   sdf.format(date);
+        return sDate;
+	}
+	
+	private void loadCache(String cacheType) throws CorruptIndexException, IOException{
+		String filePath=Configure.CachePath;
+		if (cacheType.equalsIgnoreCase(Configure.DC_DOCUMENT_CACHE)){
+			System.out.println("load DC");
+			// get cache node from SSD
+			// fill cache
+			this.documentCache.setMemoryLimitMB(this.inputParameters.memoryLimitMB_DC);
+			BufferedReader reader= new BufferedReader(new FileReader(new File (filePath+"DC.txt")));
+			String line = "";
+			while (true) {
+				line = reader.readLine();
+				if (line == null)	break;
+				
+				StringTokenizer tokenizer; 
+				tokenizer = new StringTokenizer(line, "\t");
+				Vector<String> tempStrVec = new Vector<String>();
+				
+				while (tokenizer.hasMoreTokens()) {
+					tempStrVec.add(tokenizer.nextToken()); 
+				}
+				
+				if (tempStrVec.size() < 2)	{System.out.println("line size !=2");continue;}
+				if(tempStrVec.size()>=2){
+					int docID=Integer.parseInt(tempStrVec.elementAt(0));
+					long frequency=Long.parseLong(tempStrVec.elementAt(1));
+				//	double cost= Double.parseDouble(tempStrVec.elementAt(2));
+					Document doc=searcher.doc(docID);
+					int tempNumBytes = RAMEstimator.INT_NUM_BYTE + RAMEstimator.getNumBytesOfDocument(doc);
+					CacheNode<Integer, Document> tempNode = new CacheNode<Integer, Document>(docID, doc, tempNumBytes);
+					tempNode.frequency=frequency;
+				//	tempNode.cost=cost;
+					this.documentCache.put(tempNode);
+					tempNode=null;
+					doc=null;
+				}
+				tokenizer=null;
+				tempStrVec=null;
+			}
+			reader=null;
+			line=null;
+		}
+		
+		if (cacheType.equalsIgnoreCase(Configure.RLZDC_DOCUMENT_CACHE)){
+			System.out.println("load RLZDC");
+	
+			this.RLZDocumentCache.setMemoryLimitMB(this.inputParameters.memoryLimitMB_RLZDC);
+			BufferedReader reader = new BufferedReader(new FileReader(new File (filePath+"DC.txt")));
+			String line = "";
+			while (true) {
+				line = reader.readLine();
+				if (line == null)	break;
+				
+				StringTokenizer tokenizer; 
+				tokenizer = new StringTokenizer(line, "\t");
+				Vector<String> tempStrVec = new Vector<String>();
+				
+				while (tokenizer.hasMoreTokens()) {
+					tempStrVec.add(tokenizer.nextToken()); 
+				}
+				
+				if (tempStrVec.size() < 2)	{System.out.println("line size !=2");continue;}
+				if(tempStrVec.size()>=2){
+					int docID=Integer.parseInt(tempStrVec.elementAt(0));
+					long frequency=Long.parseLong(tempStrVec.elementAt(1));
+			//		double cost= Double.parseDouble(tempStrVec.elementAt(2));
+					CompressedDocument doc=this.getCompressedDocumentFromSSD(docID);
+					int tempNumBytes = RAMEstimator.INT_NUM_BYTE + RAMEstimator.getNumBytesOfRLZDocument(doc);
+					CacheNode<Integer, CompressedDocument> tempNode = new CacheNode<Integer, CompressedDocument>(docID, doc, tempNumBytes);
+					tempNode.frequency=frequency;
+			//		tempNode.cost=cost;
+					this.RLZDocumentCache.put(tempNode);
+					tempNode=null;
+					doc=null;
+				}
+				tokenizer=null;
+				tempStrVec=null;
+			}
+			reader=null;
+			line=null;
+		}
+		
+		if (cacheType.equalsIgnoreCase(Configure.CRLZDC_DOCUMENT_CACHE)){
+			System.out.println("load CRLZDC");
+	
+			this.CRLZDocumentCache.setMemoryLimitMB(this.inputParameters.memoryLimitMB_CRLZDC);
+			BufferedReader reader = new BufferedReader(new FileReader(new File (filePath+"DC.txt")));
+			String line = "";
+			while (true) {
+				line = reader.readLine();
+				if (line == null)	break;
+				
+				StringTokenizer tokenizer; 
+				tokenizer = new StringTokenizer(line, "\t");
+				Vector<String> tempStrVec = new Vector<String>();
+				
+				while (tokenizer.hasMoreTokens()) {
+					tempStrVec.add(tokenizer.nextToken()); 
+				}
+				
+				if (tempStrVec.size() < 2)	{System.out.println("line size !=2");continue;}
+				if(tempStrVec.size()>=2){
+					int docID=Integer.parseInt(tempStrVec.elementAt(0));
+					long frequency=Long.parseLong(tempStrVec.elementAt(1));
+			//		double cost= Double.parseDouble(tempStrVec.elementAt(2));
+					CompressedRLZ doc=this.getCompressedRLZ(docID);
+					int tempNumBytes = RAMEstimator.INT_NUM_BYTE + RAMEstimator.getNumBytesOfCRLZDocument(doc);
+					CacheNode<Integer, CompressedRLZ> tempNode = new CacheNode<Integer, CompressedRLZ>(docID, doc, tempNumBytes);
+					tempNode.frequency=frequency;
+			//		tempNode.cost=cost;
+					this.CRLZDocumentCache.put(tempNode);
+					tempNode=null;
+					doc=null;
+				}
+				tokenizer=null;
+				tempStrVec=null;
+			}
+			reader=null;
+			line=null;
+		}
+		
+		if (cacheType.equalsIgnoreCase(Configure.SC_SNIPPET_CACHE)){
+			System.out.println("load SC");
+			this.snippetCache.setMemoryLimitMB(this.inputParameters.memoryLimitMB_SC);
+			BufferedReader reader = new BufferedReader(new FileReader(new File (filePath+"FC.txt")));
+			String line = "";
+			while (true) {
+				line = reader.readLine();
+				if (line == null)	break;
+				
+				StringTokenizer tokenizer; 
+				tokenizer = new StringTokenizer(line, "\t");
+				Vector<String> tempStrVec = new Vector<String>();
+				
+				while (tokenizer.hasMoreTokens()) {
+					tempStrVec.add(tokenizer.nextToken()); 
+				}
+				
+				if (tempStrVec.size() != 2)	{System.out.println("line size !=2");continue;}
+				if(tempStrVec.size()==2){
+					String key=tempStrVec.elementAt(0);
+					long frequency=Long.parseLong(tempStrVec.elementAt(1));
+			//		double cost= Double.parseDouble(tempStrVec.elementAt(2));
+					Snippet snip=this.ssdForSnippet.getSnippetFromSSD(key);;
+					int tempNumBytes = RAMEstimator.INT_NUM_BYTE + RAMEstimator.getNumBytesOfSnippet(snip);
+					CacheNode<String, Snippet> tempNode = new CacheNode<String, Snippet>(key, snip, tempNumBytes);
+					tempNode.frequency=frequency;
+			//		tempNode.cost=cost;
+					this.snippetCache.put(tempNode);
+					tempNode=null;
+					snip=null;
+				}
+				tokenizer=null;
+				tempStrVec=null;
+			}
+			reader=null;
+			line=null;
+		}
+		if (cacheType.equalsIgnoreCase(Configure.FC_FRAG_CACHE)){
+			System.out.println("load FC");
+		
+			this.fragCache.setMemoryLimitMB(this.inputParameters.memoryLimitMB_FC);
+			
+			BufferedReader reader = new BufferedReader(new FileReader(new File (filePath+"FC.txt")));
+			String line = "";
+			while (true) {
+				line = reader.readLine();
+				if (line == null)	break;
+				
+				StringTokenizer tokenizer; 
+				tokenizer = new StringTokenizer(line, "\t");
+				Vector<String> tempStrVec = new Vector<String>();
+				
+				while (tokenizer.hasMoreTokens()) {
+					tempStrVec.add(tokenizer.nextToken()); 
+				}
+				
+				if (tempStrVec.size() != 2)	{System.out.println("line size !=2");continue;}
+				if(tempStrVec.size()==2){
+					String key=tempStrVec.elementAt(0);
+					long frequency=Long.parseLong(tempStrVec.elementAt(1));
+			//		double cost= Double.parseDouble(tempStrVec.elementAt(2));
+					Frag frag=this.ssd.getFragmentFromSSD(key);
+					int tempNumBytes = RAMEstimator.INT_NUM_BYTE + RAMEstimator.getNumBytesOfFrag(frag);
+					CacheNode<String, Frag> tempNode = new CacheNode<String, Frag>(key, frag, tempNumBytes);
+					tempNode.frequency=frequency;
+			//		tempNode.cost=cost;
+					this.fragCache.put(tempNode);
+					tempNode=null;
+					frag=null;
+				}
+				tokenizer=null;
+				tempStrVec=null;
+			}
+			reader=null;
+			line=null;
+		}
+	}
+	
+	// after warm up the cache by running the training data
+	// have to fill the cache by some ways, e.g., frequency-based or weight-based etc
+	private void fillStaticCache(String cacheType) throws CorruptIndexException, IOException{
+		// fill the cache according to the cache strategy
+//		HashMap<K, CacheNode<K,V>> cacheContent = 
+		if (cacheType.equalsIgnoreCase(Configure.QRC_RESULT_CACHE)){
+			// get the content of the original cache content from training phrase
+			HashMap<Query, CacheNode<Query, List<Snippet>>> resultCacheContent = resultCache.getCacheContent();
+			
+			ArrayList<CacheNode> arrayList = new ArrayList<CacheNode>(resultCacheContent.values());
+			
+			// then sort the CacheNode by different strategies
+			Comparator<CacheNode> comparator = null;
+			if (this.inputParameters.cacheStrategy_QRC.equalsIgnoreCase(CacheStrategy.StaQTF))
+				comparator = new SortByFrequency();
+			else if (this.inputParameters.cacheStrategy_QRC.equalsIgnoreCase(CacheStrategy.StaQTFDF))
+				comparator = new SortByFrequencySize();
+			else if (this.inputParameters.cacheStrategy_QRC.equalsIgnoreCase(CacheStrategy.StaCA))
+				comparator = new SortByFrequencyCostSize();
+			
+			// note: all these comparators are min-heaps
+			// after sorting, arrayList[0] has the smallest value
+			Collections.sort(arrayList, comparator);
+			
+			this.resultCache.destroy();
+			this.resultCache.setMemoryLimitMB(this.inputParameters.memoryLimitMB_QRC);
+			
+			for (int i = arrayList.size() - 1; i >= 0; i --){
+				CacheNode<Query, List<Snippet>> tempNode = arrayList.get(i);
+				this.resultCache.put(tempNode);
+//				System.out.print(tempNode.frequency + " ");
+			}
+			
+			resultCacheContent = null;
+		}
+		
+		if (cacheType.equalsIgnoreCase(Configure.PLC_POSTINGLIST_CACHE)){
+			// get the content of the original cache content from training phrase
+			HashMap<Term, CacheNode<Term, IndexInput>> postingCacheContent = postingCache.getCacheContent();
+
+			ArrayList<CacheNode> arrayList = new ArrayList<CacheNode>(postingCacheContent.values());
+			
+			// then sort the CacheNode by different strategies
+			Comparator<CacheNode> comparator = null;
+			if (this.inputParameters.cacheStrategy_PLC.equalsIgnoreCase(CacheStrategy.StaQTF))
+				comparator = new SortByFrequency();
+			else if (this.inputParameters.cacheStrategy_PLC.equalsIgnoreCase(CacheStrategy.StaQTFDF))
+				comparator = new SortByFrequencySize();
+			else if (this.inputParameters.cacheStrategy_PLC.equalsIgnoreCase(CacheStrategy.StaCA))
+				comparator = new SortByFrequencyCostSize();
+			
+			// note: all these comparators are min-heaps
+			// after sorting, arrayList[0] has the smallest value
+			Collections.sort(arrayList, comparator);
+			
+			this.postingCache.destroy();
+			this.postingCache.setMemoryLimitMB(this.inputParameters.memoryLimitMB_PLC);
+			
+			for (int i = arrayList.size() - 1; i >= 0; i --){
+				CacheNode<Term, IndexInput> tempNode = arrayList.get(i);
+				this.postingCache.put(tempNode);
+			}
+
+			postingCacheContent = null;
+		}
+		
+		if (cacheType.equalsIgnoreCase(Configure.DC_DOCUMENT_CACHE)){
+			System.out.println("fill DC");
+			// get the content of the original cache content from training phrase
+			HashMap<Integer, CacheNode<Integer, Document>> documentCacheContent = documentCache.getCacheContent();
+
+			ArrayList<CacheNode> arrayList = new ArrayList<CacheNode>(documentCacheContent.values());
+			
+			// then sort the CacheNode by different strategies
+			Comparator<CacheNode> comparator = null;
+			if (this.inputParameters.cacheStrategy_DC.equalsIgnoreCase(CacheStrategy.StaQTF))
+				comparator = new SortByFrequency();
+			else if (this.inputParameters.cacheStrategy_DC.equalsIgnoreCase(CacheStrategy.StaQTFDF))
+				comparator = new SortByFrequencySize();
+			else if (this.inputParameters.cacheStrategy_DC.equalsIgnoreCase(CacheStrategy.StaCA))
+				comparator = new SortByFrequencyCostSize();
+			
+			// note: all these comparators are min-heaps
+			// after sorting, arrayList[0] has the smallest value
+			Collections.sort(arrayList, comparator);
+			
+			this.documentCache.destroy();
+			this.documentCache.setMemoryLimitMB(this.inputParameters.memoryLimitMB_DC);
+			
+			for (int i = arrayList.size() - 1; i >= 0; i --){
+				CacheNode<Integer, Document> tempNode = arrayList.get(i);
+				tempNode.value=new Document();
+				tempNode.value=searcher.doc(tempNode.key);
+				this.documentCache.put(tempNode);
+			}
+
+			documentCacheContent = null;
+		}
+		
+		if (cacheType.equalsIgnoreCase(Configure.RLZDC_DOCUMENT_CACHE)){
+			System.out.println("fill RLZDC");
+	//		int count=0;
+			// get the content of the original cache content from training phrase
+			HashMap<Integer, CacheNode<Integer, CompressedDocument>> RLZDocumentCacheContent = RLZDocumentCache.getCacheContent();
+
+			ArrayList<CacheNode> arrayList = new ArrayList<CacheNode>(RLZDocumentCacheContent.values());
+			
+			// then sort the CacheNode by different strategies
+			Comparator<CacheNode> comparator = null;
+			if (this.inputParameters.cacheStrategy_RLZDC.equalsIgnoreCase(CacheStrategy.StaQTF))
+				comparator = new SortByFrequency();
+			else if (this.inputParameters.cacheStrategy_RLZDC.equalsIgnoreCase(CacheStrategy.StaQTFDF))
+				comparator = new SortByFrequencySize();
+			else if (this.inputParameters.cacheStrategy_RLZDC.equalsIgnoreCase(CacheStrategy.StaCA))
+				comparator = new SortByFrequencyCostSize();
+			
+			// note: all these comparators are min-heaps
+			// after sorting, arrayList[0] has the smallest value
+			Collections.sort(arrayList, comparator);
+			
+			this.RLZDocumentCache.destroy();
+			this.RLZDocumentCache.setMemoryLimitMB(this.inputParameters.memoryLimitMB_RLZDC);
+			
+			for (int i = arrayList.size() - 1; i >= 0; i --){
+				CacheNode<Integer, CompressedDocument> tempNode = arrayList.get(i);
+				tempNode.value=new CompressedDocument();
+				tempNode.value=this.getCompressedDocumentFromSSD(tempNode.key);
+				this.RLZDocumentCache.put(tempNode);
+	//			count++;
+				if (this.RLZDocumentCache.cacheSize() % 1000 == 0)
+					System.out.println(this.RLZDocumentCache.cacheSize());
+			}
+
+			RLZDocumentCacheContent = null;
+		}
+		
+		if (cacheType.equalsIgnoreCase(Configure.CRLZDC_DOCUMENT_CACHE)){
+			System.out.println("fill CRLZDC");
+	//		int count=0;
+			// get the content of the original cache content from training phrase
+			HashMap<Integer, CacheNode<Integer, CompressedRLZ>> CRLZDocumentCacheContent = CRLZDocumentCache.getCacheContent();
+
+			ArrayList<CacheNode> arrayList = new ArrayList<CacheNode>(CRLZDocumentCacheContent.values());
+			
+			// then sort the CacheNode by different strategies
+			Comparator<CacheNode> comparator = null;
+			if (this.inputParameters.cacheStrategy_CRLZDC.equalsIgnoreCase(CacheStrategy.StaQTF))
+				comparator = new SortByFrequency();
+			else if (this.inputParameters.cacheStrategy_CRLZDC.equalsIgnoreCase(CacheStrategy.StaQTFDF))
+				comparator = new SortByFrequencySize();
+			else if (this.inputParameters.cacheStrategy_CRLZDC.equalsIgnoreCase(CacheStrategy.StaCA))
+				comparator = new SortByFrequencyCostSize();
+			
+			// note: all these comparators are min-heaps
+			// after sorting, arrayList[0] has the smallest value
+			Collections.sort(arrayList, comparator);
+			
+			this.CRLZDocumentCache.destroy();
+			this.CRLZDocumentCache.setMemoryLimitMB(this.inputParameters.memoryLimitMB_CRLZDC);
+			
+			for (int i = arrayList.size() - 1; i >= 0; i --){
+				CacheNode<Integer, CompressedRLZ> tempNode = arrayList.get(i);
+				tempNode.value=new CompressedRLZ();
+				tempNode.value=this.getCompressedRLZ(tempNode.key);
+				this.CRLZDocumentCache.put(tempNode);
+	//			count++;
+				if (this.RLZDocumentCache.cacheSize() % 1000 == 0)
+					System.out.println(this.RLZDocumentCache.cacheSize());
+			}
+
+			CRLZDocumentCacheContent = null;
+		}
+		
+		if (cacheType.equalsIgnoreCase(Configure.SC_SNIPPET_CACHE)){
+			// get the content of the original cache content from training phrase
+			HashMap<String, CacheNode<String, Snippet>> snippetCacheContent = snippetCache.getCacheContent();
+
+			ArrayList<CacheNode> arrayList = new ArrayList<CacheNode>(snippetCacheContent.values());
+			
+			// then sort the CacheNode by different strategies
+			Comparator<CacheNode> comparator = null;
+			if (this.inputParameters.cacheStrategy_SC.equalsIgnoreCase(CacheStrategy.StaQTF))
+				comparator = new SortByFrequency();
+			else if (this.inputParameters.cacheStrategy_SC.equalsIgnoreCase(CacheStrategy.StaQTFDF))
+				comparator = new SortByFrequencySize();
+			else if (this.inputParameters.cacheStrategy_SC.equalsIgnoreCase(CacheStrategy.StaCA))
+				comparator = new SortByFrequencyCostSize();
+			
+			// note: all these comparators are min-heaps
+			// after sorting, arrayList[0] has the smallest value
+			Collections.sort(arrayList, comparator);
+			
+			this.snippetCache.destroy();
+			this.snippetCache.setMemoryLimitMB(this.inputParameters.memoryLimitMB_SC);
+			
+			for (int i = arrayList.size() - 1; i >= 0; i --){
+				CacheNode<String, Snippet> tempNode = arrayList.get(i);
+				this.snippetCache.put(tempNode);
+			}
+
+			snippetCacheContent = null;
+		}
+		if (cacheType.equalsIgnoreCase(Configure.FC_FRAG_CACHE)){
+			System.out.println("fill FC");
+		//	int count=0;
+			// get the content of the original cache content from training phrase
+			HashMap<String, CacheNode<String, Frag>> fragCacheContent = fragCache.getCacheContent();
+
+			ArrayList<CacheNode> arrayList = new ArrayList<CacheNode>(fragCacheContent.values());
+			
+			// then sort the CacheNode by different strategies
+			Comparator<CacheNode> comparator = null;
+			if (this.inputParameters.cacheStrategy_FC.equalsIgnoreCase(CacheStrategy.StaQTF))
+				comparator = new SortByFrequency();
+			else if (this.inputParameters.cacheStrategy_FC.equalsIgnoreCase(CacheStrategy.StaQTFDF))
+				comparator = new SortByFrequencySize();
+			else if (this.inputParameters.cacheStrategy_FC.equalsIgnoreCase(CacheStrategy.StaCA))
+				comparator = new SortByFrequencyCostSize();
+			
+			// note: all these comparators are min-heaps
+			// after sorting, arrayList[0] has the smallest value
+			Collections.sort(arrayList, comparator);
+			
+			this.fragCache.destroy();
+			this.fragCache.setMemoryLimitMB(this.inputParameters.memoryLimitMB_FC);
+			
+			for (int i = arrayList.size() - 1; i >= 0; i --){
+				CacheNode<String, Frag> tempNode = arrayList.get(i);
+				tempNode.value=new Frag();
+				tempNode.value=this.ssd.getFragmentFromSSD(tempNode.key);
+				this.fragCache.put(tempNode);
+		//		count++;
+				if (this.fragCache.cacheSize() % 1000 == 0)
+					System.out.println(this.fragCache.cacheSize());
+			}
+
+			fragCacheContent = null;
+		}
+	}
+	
+	// set un-limited memory for static cache
+	// for training data set, isCounting = true: record the access frequency of each node
+	// for testing data set, isCounting = false
+	// isReset = true, means to set the cache to its original allocated space
+	// otherwise, set it to infinity (i.e., training phrase)
+	private void setMemoryLimit(boolean isCounting, boolean isReset){
+		double memoryLimitMB = RAMEstimator.UN_LIMIT_MEMORY;
+		if (inputParameters.memoryLimitMB() > 0 && this.inputParameters.resultCacheTurnOn && this.inputParameters.isStaticCache(Configure.QRC_RESULT_CACHE)){
+			if (isReset) memoryLimitMB = this.inputParameters.memoryLimitMB_QRC;
+			this.resultCache.setMemoryLimitMB(memoryLimitMB);
+			this.resultCache.setEnableCounting(isCounting);
+		}
+		
+		if (inputParameters.memoryLimitMB() > 0 && this.inputParameters.postingListCacheTurnOn && this.inputParameters.isStaticCache(Configure.PLC_POSTINGLIST_CACHE)){
+			if (isReset) memoryLimitMB = this.inputParameters.memoryLimitMB_PLC;
+			this.postingCache.setMemoryLimitMB(memoryLimitMB);
+			this.postingCache.setEnableCounting(isCounting);
+		}
+		
+		if (inputParameters.memoryLimitMB() > 0 && this.inputParameters.documentCacheTurnOn && this.inputParameters.isStaticCache(Configure.DC_DOCUMENT_CACHE)){
+			if (isReset) memoryLimitMB = this.inputParameters.memoryLimitMB_DC;
+			this.documentCache.setMemoryLimitMB(memoryLimitMB);
+			this.documentCache.setEnableCounting(isCounting);
+		}
+		
+		if (inputParameters.memoryLimitMB() > 0 && this.inputParameters.RLZDocumentCacheTurnOn && this.inputParameters.isStaticCache(Configure.RLZDC_DOCUMENT_CACHE)){
+			if (isReset) memoryLimitMB = this.inputParameters.memoryLimitMB_RLZDC;
+			this.RLZDocumentCache.setMemoryLimitMB(memoryLimitMB);
+			this.RLZDocumentCache.setEnableCounting(isCounting);
+		}
+		
+		if (inputParameters.memoryLimitMB() > 0 && this.inputParameters.CRLZDocumentCacheTurnOn && this.inputParameters.isStaticCache(Configure.CRLZDC_DOCUMENT_CACHE)){
+			if (isReset) memoryLimitMB = this.inputParameters.memoryLimitMB_CRLZDC;
+			this.CRLZDocumentCache.setMemoryLimitMB(memoryLimitMB);
+			this.CRLZDocumentCache.setEnableCounting(isCounting);
+		}
+
+		if (inputParameters.memoryLimitMB() > 0 && this.inputParameters.snippetCacheTurnOn && this.inputParameters.isStaticCache(Configure.SC_SNIPPET_CACHE)){
+			if (isReset) memoryLimitMB = this.inputParameters.memoryLimitMB_SC;
+			this.snippetCache.setMemoryLimitMB(memoryLimitMB);
+			this.snippetCache.setEnableCounting(isCounting);
+		}
+		
+		if (inputParameters.memoryLimitMB() > 0 && this.inputParameters.fragCacheTurnOn && this.inputParameters.isStaticCache(Configure.FC_FRAG_CACHE)){
+			if (isReset) memoryLimitMB = this.inputParameters.memoryLimitMB_FC;
+			this.fragCache.setMemoryLimitMB(memoryLimitMB);
+			this.fragCache.setEnableCounting(isCounting);
+		}
+	}
+	
+	// for QRC, DC, SC and dynamic posting list cache
+	private void trainingPhrase_normal() throws CorruptIndexException, IOException{
+		
+		// training query-log file path
+		String trainingDataFilePath = Configure.TRAIN_DATA_PATH;
+		
+		// here, we set the memory size to be un-limit
+		// to get the statistical information
+		this.setMemoryLimit(true, false); // true means counting frequency, used in the training phrase
+		// false means NOT reset, i.e., set it as the unlimited memory
+		
+		runQueriesFromFile(trainingDataFilePath);
+	//	printOutCacheBeforeFill();
+		if(inputParameters.memoryLimitMB() > 0 && this.inputParameters.fragCacheTurnOn){
+			this.fragCache.withValue=true;
+		}
+		if (inputParameters.memoryLimitMB() > 0 && this.inputParameters.documentCacheTurnOn){
+			this.documentCache.withValue=true;
+		}
+		
+		if (inputParameters.memoryLimitMB() > 0 && this.inputParameters.RLZDocumentCacheTurnOn){
+			this.RLZDocumentCache.withValue=true;
+		}
+		
+		if (inputParameters.memoryLimitMB() > 0 && this.inputParameters.CRLZDocumentCacheTurnOn){
+			this.CRLZDocumentCache.withValue=true;
+		}
+		
+		if (inputParameters.memoryLimitMB() > 0 && this.inputParameters.resultCacheTurnOn && this.inputParameters.isStaticCache(Configure.QRC_RESULT_CACHE)){
+			this.fillStaticCache(Configure.QRC_RESULT_CACHE);
+		}
+		
+		if (inputParameters.memoryLimitMB() > 0 && this.inputParameters.postingListCacheTurnOn && this.inputParameters.isStaticCache(Configure.PLC_POSTINGLIST_CACHE)){
+			this.fillStaticCache(Configure.PLC_POSTINGLIST_CACHE);
+		}
+		
+		if (inputParameters.memoryLimitMB() > 0 && this.inputParameters.documentCacheTurnOn && this.inputParameters.isStaticCache(Configure.DC_DOCUMENT_CACHE)){
+			this.fillStaticCache(Configure.DC_DOCUMENT_CACHE);
+		}
+		
+		if (inputParameters.memoryLimitMB() > 0 && this.inputParameters.RLZDocumentCacheTurnOn && this.inputParameters.isStaticCache(Configure.RLZDC_DOCUMENT_CACHE)){
+			this.fillStaticCache(Configure.RLZDC_DOCUMENT_CACHE);
+		}
+		
+		if (inputParameters.memoryLimitMB() > 0 && this.inputParameters.CRLZDocumentCacheTurnOn && this.inputParameters.isStaticCache(Configure.CRLZDC_DOCUMENT_CACHE)){
+			this.fillStaticCache(Configure.CRLZDC_DOCUMENT_CACHE);
+		}
+		
+		if (inputParameters.memoryLimitMB() > 0 && this.inputParameters.snippetCacheTurnOn && this.inputParameters.isStaticCache(Configure.SC_SNIPPET_CACHE)){
+			this.fillStaticCache(Configure.SC_SNIPPET_CACHE);
+		}
+		
+		if (inputParameters.memoryLimitMB() > 0 && this.inputParameters.fragCacheTurnOn && this.inputParameters.isStaticCache(Configure.FC_FRAG_CACHE)){
+			this.fillStaticCache(Configure.FC_FRAG_CACHE);
+		}
+	}
+	
+//	// only for static posting list cache training
+//	// because, we cannot load everything into main memory
+//	private void trainingPhrase_Static_PLC(){
+//		CacheUtils cacheUtils = new CacheUtils();
+//		if (inputParameters.cacheStrategy_PLC.equalsIgnoreCase(CacheStrategy.StaQTF)){
+//			postingCache = new StaticCache<Term, IndexInput>(inputParameters.memoryLimitMB_PLC);
+//			postingCache = cacheUtils.loadPostingListCache(CacheUtils.QTF_NAME_POSTING, inputParameters.memoryLimitMB_PLC);
+//		} else if (inputParameters.cacheStrategy_PLC.equalsIgnoreCase(CacheStrategy.StaQTFDF)){
+//			postingCache = new StaticCache<Term, IndexInput>(inputParameters.memoryLimitMB_PLC);
+//			postingCache = cacheUtils.loadPostingListCache(CacheUtils.QTFDF_NAME_POSTING, inputParameters.memoryLimitMB_PLC);
+//		} else if (inputParameters.cacheStrategy_PLC.equalsIgnoreCase(CacheStrategy.StaCA)){
+//			postingCache = new StaticCache<Term, IndexInput>(inputParameters.memoryLimitMB_PLC);
+//			postingCache = cacheUtils.loadPostingListCache(CacheUtils.CA_NAME_POSTING, inputParameters.memoryLimitMB_PLC);
+//		}
+//	}
+	
+	// only for static posting list cache training
+	// because, we cannot load everything into main memory
+	private void trainingPhrase_Static_PLC(){
+		CacheUtils cacheUtils = new CacheUtils();
+		if (inputParameters.cacheStrategy_PLC.equalsIgnoreCase(CacheStrategy.StaQTF)){
+			postingCache = new StaticCache<Term, IndexInput>(inputParameters.memoryLimitMB_PLC);
+			postingCache = cacheUtils.loadPostingListCacheByTerms(CacheUtils.QTF_NAME, inputParameters.memoryLimitMB_PLC);
+		} else if (inputParameters.cacheStrategy_PLC.equalsIgnoreCase(CacheStrategy.StaQTFDF)){
+			postingCache = new StaticCache<Term, IndexInput>(inputParameters.memoryLimitMB_PLC);
+			postingCache = cacheUtils.loadPostingListCacheByTerms(CacheUtils.QTFDF_NAME, inputParameters.memoryLimitMB_PLC);
+		} else if (inputParameters.cacheStrategy_PLC.equalsIgnoreCase(CacheStrategy.StaCA)){
+			postingCache = new StaticCache<Term, IndexInput>(inputParameters.memoryLimitMB_PLC);
+			postingCache = cacheUtils.loadPostingListCacheByTerms(CacheUtils.CA_NAME, inputParameters.memoryLimitMB_PLC);
+		}
+	}
+	
+	// training phrase: warm up the cache
+	private void trainingPhrase() throws CorruptIndexException, IOException{
+		// static posting list cache
+		if (inputParameters.memoryLimitMB() > 0 && this.inputParameters.postingListCacheTurnOn && this.inputParameters.isStaticCache(Configure.PLC_POSTINGLIST_CACHE)){
+			this.trainingPhrase_Static_PLC();
+		} else
+			trainingPhrase_normal();
+	}
+	
+	// testing phrase: measure experimental results
+	private void testingPhrase(){
+		System.out.println("test");
+		// testing query-log file path
+		String testingDataFilePath = Configure.TEST_DATA_PATH;
+		
+		// reset to normal setting
+		this.setMemoryLimit(false, true);
+		// false means no need to counting frequency, true means to reset to its original allocated space
+		
+		// reset the outputMeasurement
+		this.outputMeasurement.reset();
+		
+		String currentTime = getCurrentTime();
+		this.outputMeasurement.startTime = currentTime;
+		
+		long startTime = System.nanoTime();
+		runQueriesFromFile(testingDataFilePath);
+		long endTime = System.nanoTime();
+		
+		currentTime = getCurrentTime();
+		this.outputMeasurement.endTime = currentTime;
+		
+		double totalTime = (double)(endTime - startTime)/(double)1000000000.0f;	//seconds
+		this.outputMeasurement.totalRunTime = totalTime;
+		
+		double averageTime = totalTime / (double)outputMeasurement.numOfQueries;
+		this.outputMeasurement.averageTime = averageTime;
+		
+		if (inputParameters.memoryLimitMB() > 0 && inputParameters.resultCacheTurnOn){
+			this.outputMeasurement.resultCacheHitRatio = this.resultCache.getHitRatio();
+	    	this.outputMeasurement.numOfQRCNodes=this.resultCache.cacheSize();
+	    	this.outputMeasurement.UsedMemoryOfQRC=this.resultCache.getUsedMemoryInCacheMB();
+		}
+	
+		if (inputParameters.memoryLimitMB() > 0 && inputParameters.postingListCacheTurnOn)
+			this.outputMeasurement.postingListCacheHitRatio = this.postingCache.getHitRatio();
+	
+		if (inputParameters.memoryLimitMB() > 0 && inputParameters.documentCacheTurnOn){
+			this.outputMeasurement.documentCacheHitRatio = this.documentCache.getHitRatio();
+	    	this.outputMeasurement.numOfDCNodes=this.documentCache.cacheSize();
+	    	this.outputMeasurement.UsedMemoryOfDC=this.documentCache.getUsedMemoryInCacheMB();
+		}
+	    	
+	    if (inputParameters.memoryLimitMB() > 0 && inputParameters.RLZDocumentCacheTurnOn){
+			this.outputMeasurement.RLZDocumentCacheHitRatio = this.RLZDocumentCache.getHitRatio();
+		    this.outputMeasurement.numOfRLZDCNodes=this.RLZDocumentCache.cacheSize();
+		    this.outputMeasurement.UsedMemoryOfRLZDC=this.RLZDocumentCache.getUsedMemoryInCacheMB();
+	    }
+	    
+	    if (inputParameters.memoryLimitMB() > 0 && inputParameters.CRLZDocumentCacheTurnOn){
+			this.outputMeasurement.CRLZDocumentCacheHitRatio = this.CRLZDocumentCache.getHitRatio();
+		    this.outputMeasurement.numOfCRLZDCNodes=this.CRLZDocumentCache.cacheSize();
+		    this.outputMeasurement.UsedMemoryOfCRLZDC=this.CRLZDocumentCache.getUsedMemoryInCacheMB();
+	    }
+	
+		if (inputParameters.memoryLimitMB() > 0 && inputParameters.snippetCacheTurnOn){
+			this.outputMeasurement.snippetCacheHitRatio = this.snippetCache.getHitRatio();
+	    	this.outputMeasurement.numOfSCNodes=this.snippetCache.cacheSize();
+	        this.outputMeasurement.UsedMemoryOfSC=this.snippetCache.getUsedMemoryInCacheMB();
+		}
+		
+		if (inputParameters.memoryLimitMB() > 0 && inputParameters.fragCacheTurnOn){
+			this.outputMeasurement.fragCacheHitRatio = this.fragCache.getHitRatio();
+		    this.outputMeasurement.numOfFCNodes=this.fragCache.cacheSize();
+		    this.outputMeasurement.UsedMemoryOfFC=this.fragCache.getUsedMemoryInCacheMB();
+		}
+	}
+	
+	// for testing use
+	private void printOutCacheAfterTrain(){
+        String fileName = "CacheAfterTrain_"+this.generateOutpuFileName();
+//      fileName = "D:\\temp\\TRAIN_" + fileName;
+        fileName = Configure.outputFileDirectory + fileName;
+        int totalLength =    0;
+        int totalNumOfBytes =    0;
+        StringBuffer str=new StringBuffer();
+        try{
+            BufferedWriter writer = new BufferedWriter(new FileWriter(new File (fileName)));
+            /*if (inputParameters.memoryLimitMB() >    0 && inputParameters.resultCacheTurnOn){
+                str.append("**************************************************"+"\n");
+                str.append("Result Cache:"+"\n");
+                HashMap<Query, CacheNode<Query, List<Snippet>>> resultCacheContent = resultCache.getCacheContent();
+                ArrayList<CacheNode> arrayList = new ArrayList<CacheNode>(resultCacheContent.values());
+                 
+                for (int i =    0; i < arrayList.size(); i ++){
+                	CacheNode<Query, List<Snippet>> tempNode = arrayList.get(i);
+                    str.append("**************************************************"+"\n");
+                    str.append(tempNode.key + "\n");
+                    List<Snippet> list = (List<Snippet>)tempNode.value;
+                    for(Snippet s:list){
+                    	str.append("titlt:"+s.getTitle()+"\n");
+                    	str.append("url:"+s.getUrl()+"\n");
+                    	str.append("Summarization:"+s.getSummarization()+"\n");
+                    }
+                    int len = list.size();
+                    totalLength += len;
+                    totalNumOfBytes += tempNode.numOfBytes;
+                    
+                    str.append(len + "\t" + tempNode.numOfBytes + "\t" + tempNode.frequency + "\n");
+                }
+            }
+             
+            if (inputParameters.memoryLimitMB() >    0 && inputParameters.postingListCacheTurnOn){
+                str.append("**************************************************"+"\n");
+                str.append("Posting List Cache:"+"\n");
+                HashMap<Term, CacheNode<Term, IndexInput>> postingCacheContent = postingCache.getCacheContent();
+                ArrayList<CacheNode> arrayList = new ArrayList<CacheNode>(postingCacheContent.values());
+                for (int i =    0; i < arrayList.size(); i ++){
+                    CacheNode<Term, IndexInput> tempNode = arrayList.get(i);
+                     
+                     
+                    totalNumOfBytes += tempNode.numOfBytes;
+                    str.append("**************************************************"+"\n");
+                    str.append(tempNode.key + "\t" + tempNode.numOfBytes + "\t" + tempNode.frequency + "\n");
+                }
+            }
+             */
+            if (inputParameters.memoryLimitMB() >    0 && inputParameters.documentCacheTurnOn){
+                str.append("**************************************************"+"\n");
+                str.append("Document Cache:"+"\n");
+                HashMap<Integer, CacheNode<Integer, Document>> documentCacheContent = documentCache.getCacheContent();
+                ArrayList<CacheNode> arrayList = new ArrayList<CacheNode>(documentCacheContent.values());               
+                 
+                for (int i =    0; i < arrayList.size(); i ++){
+                    CacheNode<Integer, Document> tempNode = arrayList.get(i);
+                    totalNumOfBytes += tempNode.numOfBytes;
+                    str.append("**************************************************"+"\n");
+                    str.append("=="+tempNode.key+"==" + "\t" + "++"+tempNode.numOfBytes + "++"+"\t" + tempNode.frequency + "\n");
+                }
+            }
+            
+            if (inputParameters.memoryLimitMB() >    0 && inputParameters.RLZDocumentCacheTurnOn){
+                str.append("**************************************************"+"\n");
+                str.append("RLZ Document Cache:"+"\n");
+                HashMap<Integer, CacheNode<Integer, CompressedDocument>> RLZDocumentCacheContent = RLZDocumentCache.getCacheContent();
+                ArrayList<CacheNode> arrayList = new ArrayList<CacheNode>(RLZDocumentCacheContent.values());               
+                 
+                for (int i =    0; i < arrayList.size(); i ++){
+                    CacheNode<Integer, CompressedDocument> tempNode = arrayList.get(i);
+                    totalNumOfBytes += tempNode.numOfBytes;
+                    str.append("**************************************************"+"\n");
+                    str.append("=="+tempNode.key+"==" + "\t" + "++"+tempNode.numOfBytes + "++"+"\t" + tempNode.frequency + "\n");
+                }
+            }
+            
+            if (inputParameters.memoryLimitMB() >    0 && inputParameters.CRLZDocumentCacheTurnOn){
+                str.append("**************************************************"+"\n");
+                str.append("CRLZ Document Cache:"+"\n");
+                HashMap<Integer, CacheNode<Integer, CompressedRLZ>> CRLZDocumentCacheContent = CRLZDocumentCache.getCacheContent();
+                ArrayList<CacheNode> arrayList = new ArrayList<CacheNode>(CRLZDocumentCacheContent.values());               
+                 
+                for (int i =    0; i < arrayList.size(); i ++){
+                    CacheNode<Integer, CompressedRLZ> tempNode = arrayList.get(i);
+                    totalNumOfBytes += tempNode.numOfBytes;
+                    str.append("**************************************************"+"\n");
+                    str.append("=="+tempNode.key+"==" + "\t" + "++"+tempNode.numOfBytes + "++"+"\t" + tempNode.frequency + "\n");
+                }
+            }
+             
+            if (inputParameters.memoryLimitMB() >    0 && inputParameters.snippetCacheTurnOn){
+                str.append("**************************************************"+"\n");
+                str.append("Snippet Cache:"+"\n");
+                HashMap<String, CacheNode<String, Snippet>> snippetCacheContent = snippetCache.getCacheContent();
+                ArrayList<CacheNode> arrayList = new ArrayList<CacheNode>(snippetCacheContent.values());
+                for (int i =    0; i < arrayList.size(); i ++){
+                    CacheNode<String, Snippet> tempNode = arrayList.get(i);
+                    totalNumOfBytes += tempNode.numOfBytes;
+                    str.append("**************************************************"+"\n");
+                    str.append("=="+tempNode.key +"=="+ "\t" + "=="+tempNode.numOfBytes +"=="+ "\t" + "=="+tempNode.frequency +"=="+ "\n");
+                    str.append(tempNode.value.getTitle()+"\n");
+                    str.append(tempNode.value.getUrl()+"\n");
+                    str.append(tempNode.value.getSummarization()+"\n");
+                }
+            }
+            if (inputParameters.memoryLimitMB() >    0 && inputParameters.fragCacheTurnOn){
+                str.append("**************************************************"+"\n");
+                str.append("Fragment Cache:"+"\n");
+                HashMap<String, CacheNode<String, Frag>> fragCacheContent = fragCache.getCacheContent();
+                ArrayList<CacheNode> arrayList = new ArrayList<CacheNode>(fragCacheContent.values());
+                for (int i =    0; i < arrayList.size(); i ++){
+                    CacheNode<String, Frag> tempNode = arrayList.get(i);
+                    totalNumOfBytes += tempNode.numOfBytes;
+                    str.append("**************************************************"+"\n");
+                    str.append("=="+tempNode.key +"=="+ "\t" + "=="+tempNode.numOfBytes +"=="+ "\t" + "=="+tempNode.frequency +"=="+ "\n");
+                    str.append("docID:"+tempNode.value.getDocid()+"\n");
+                    str.append("fragment start:"+tempNode.value.getfragstart()+"\n");
+                    str.append("fragment end:"+tempNode.value.getfragend()+"\n");
+                    str.append("highlights:"+"\n");
+                    for(int j=0;j<tempNode.value.getEnd().size();j++){
+                    	str.append(tempNode.value.getStart().get(j)+"\t"+tempNode.value.getEnd().get(j)+"\n");
+                    }
+                }
+            }
+             
+            str.append("totalNumOfBytes: " + totalNumOfBytes + "\n");
+            writer.write(str.toString());
+            writer.close();
+        }catch(Exception e){
+            e.printStackTrace();
+        }
+    }
+	private void printOutCacheBeforeFill(){
+        String fileName = "CacheBeforeFill_"+this.generateOutpuFileName();
+//      fileName = "D:\\temp\\TRAIN_" + fileName;
+        fileName = Configure.outputFileDirectory + fileName;
+        int totalLength =    0;
+        int totalNumOfBytes =    0;
+        StringBuffer str=new StringBuffer();
+        try{
+            BufferedWriter writer = new BufferedWriter(new FileWriter(new File (fileName)));
+            /*if (inputParameters.memoryLimitMB() >    0 && inputParameters.resultCacheTurnOn){
+                str.append("**************************************************"+"\n");
+                str.append("Result Cache:"+"\n");
+                HashMap<Query, CacheNode<Query, List<Snippet>>> resultCacheContent = resultCache.getCacheContent();
+                ArrayList<CacheNode> arrayList = new ArrayList<CacheNode>(resultCacheContent.values());
+                 
+                for (int i =    0; i < arrayList.size(); i ++){
+                	CacheNode<Query, List<Snippet>> tempNode = arrayList.get(i);
+                    str.append("**************************************************"+"\n");
+                    str.append(tempNode.key + "\n");
+                    List<Snippet> list = (List<Snippet>)tempNode.value;
+                    for(Snippet s:list){
+                    	str.append("titlt:"+s.getTitle()+"\n");
+                    	str.append("url:"+s.getUrl()+"\n");
+                    	str.append("Summarization:"+s.getSummarization()+"\n");
+                    }
+                    int len = list.size();
+                    totalLength += len;
+                    totalNumOfBytes += tempNode.numOfBytes;
+                    
+                    str.append(len + "\t" + tempNode.numOfBytes + "\t" + tempNode.frequency + "\n");
+                }
+            }
+             
+            if (inputParameters.memoryLimitMB() >    0 && inputParameters.postingListCacheTurnOn){
+                str.append("**************************************************"+"\n");
+                str.append("Posting List Cache:"+"\n");
+                HashMap<Term, CacheNode<Term, IndexInput>> postingCacheContent = postingCache.getCacheContent();
+                ArrayList<CacheNode> arrayList = new ArrayList<CacheNode>(postingCacheContent.values());
+                for (int i =    0; i < arrayList.size(); i ++){
+                    CacheNode<Term, IndexInput> tempNode = arrayList.get(i);
+                     
+                     
+                    totalNumOfBytes += tempNode.numOfBytes;
+                    str.append("**************************************************"+"\n");
+                    str.append(tempNode.key + "\t" + tempNode.numOfBytes + "\t" + tempNode.frequency + "\n");
+                }
+            }
+             */
+            if (inputParameters.memoryLimitMB() >    0 && inputParameters.documentCacheTurnOn){
+                str.append("**************************************************"+"\n");
+                str.append("Document Cache:"+"\n");
+                HashMap<Integer, CacheNode<Integer, Document>> documentCacheContent = documentCache.getCacheContent();
+                ArrayList<CacheNode> arrayList = new ArrayList<CacheNode>(documentCacheContent.values());               
+                 
+                for (int i =    0; i < arrayList.size(); i ++){
+                    CacheNode<Integer, Document> tempNode = arrayList.get(i);
+                    totalNumOfBytes += tempNode.numOfBytes;
+                    str.append("**************************************************"+"\n");
+                    str.append("=="+tempNode.key+"==" + "\t" + "++"+tempNode.numOfBytes + "++"+"\t" + tempNode.frequency + "\n");
+                }
+            }
+            
+            if (inputParameters.memoryLimitMB() >    0 && inputParameters.RLZDocumentCacheTurnOn){
+                str.append("**************************************************"+"\n");
+                str.append("RLZ Document Cache:"+"\n");
+                HashMap<Integer, CacheNode<Integer, CompressedDocument>> RLZDocumentCacheContent = RLZDocumentCache.getCacheContent();
+                ArrayList<CacheNode> arrayList = new ArrayList<CacheNode>(RLZDocumentCacheContent.values());               
+                 
+                for (int i =    0; i < arrayList.size(); i ++){
+                    CacheNode<Integer, CompressedDocument> tempNode = arrayList.get(i);
+                    totalNumOfBytes += tempNode.numOfBytes;
+                    str.append("**************************************************"+"\n");
+                    str.append("=="+tempNode.key+"==" + "\t" + "++"+tempNode.numOfBytes + "++"+"\t" + tempNode.frequency + "\n");
+                }
+            }
+            
+            if (inputParameters.memoryLimitMB() >    0 && inputParameters.CRLZDocumentCacheTurnOn){
+                str.append("**************************************************"+"\n");
+                str.append("CRLZ Document Cache:"+"\n");
+                HashMap<Integer, CacheNode<Integer, CompressedRLZ>> CRLZDocumentCacheContent = CRLZDocumentCache.getCacheContent();
+                ArrayList<CacheNode> arrayList = new ArrayList<CacheNode>(CRLZDocumentCacheContent.values());               
+                 
+                for (int i =    0; i < arrayList.size(); i ++){
+                    CacheNode<Integer, CompressedRLZ> tempNode = arrayList.get(i);
+                    totalNumOfBytes += tempNode.numOfBytes;
+                    str.append("**************************************************"+"\n");
+                    str.append("=="+tempNode.key+"==" + "\t" + "++"+tempNode.numOfBytes + "++"+"\t" + tempNode.frequency + "\n");
+                }
+            }
+             
+            if (inputParameters.memoryLimitMB() >    0 && inputParameters.snippetCacheTurnOn){
+                str.append("**************************************************"+"\n");
+                str.append("Snippet Cache:"+"\n");
+                HashMap<String, CacheNode<String, Snippet>> snippetCacheContent = snippetCache.getCacheContent();
+                ArrayList<CacheNode> arrayList = new ArrayList<CacheNode>(snippetCacheContent.values());
+                for (int i =    0; i < arrayList.size(); i ++){
+                    CacheNode<String, Snippet> tempNode = arrayList.get(i);
+                    totalNumOfBytes += tempNode.numOfBytes;
+                    str.append("**************************************************"+"\n");
+                    str.append("=="+tempNode.key +"=="+ "\t" + "=="+tempNode.numOfBytes +"=="+ "\t" + "=="+tempNode.frequency +"=="+ "\n");
+                    str.append(tempNode.value.getTitle()+"\n");
+                    str.append(tempNode.value.getUrl()+"\n");
+                    str.append(tempNode.value.getSummarization()+"\n");
+                }
+            }
+            if (inputParameters.memoryLimitMB() >    0 && inputParameters.fragCacheTurnOn){
+                str.append("**************************************************"+"\n");
+                str.append("Fragment Cache:"+"\n");
+                HashMap<String, CacheNode<String, Frag>> fragCacheContent = fragCache.getCacheContent();
+                ArrayList<CacheNode> arrayList = new ArrayList<CacheNode>(fragCacheContent.values());
+                for (int i =    0; i < arrayList.size(); i ++){
+                    CacheNode<String, Frag> tempNode = arrayList.get(i);
+                    totalNumOfBytes += tempNode.numOfBytes;
+                    System.out.println(tempNode.key);
+                    str.append("**************************************************"+"\n");
+                    str.append("=="+tempNode.key +"=="+ "\t" + "=="+tempNode.numOfBytes +"=="+ "\t" + "=="+tempNode.frequency +"=="+ "\n");
+               //     str.append("docID:"+tempNode.value.getDocid()+"\n");
+               //     str.append("fragment start:"+tempNode.value.getfragstart()+"\n");
+               //     str.append("fragment end:"+tempNode.value.getfragend()+"\n");
+               //     str.append("highlights:"+"\n");
+               //     for(int j=0;j<tempNode.value.getEnd().size();j++){
+               //     	str.append(tempNode.value.getStart().get(j)+"\t"+tempNode.value.getEnd().get(j)+"\n");
+               //     }
+                }
+            }
+             
+            str.append("totalNumOfBytes: " + totalNumOfBytes + "\n");
+            writer.write(str.toString());
+            writer.close();
+        }catch(Exception e){
+            e.printStackTrace();
+        }
+    }
+	// for testing use
+	private void printOutHitContent(){
+//		String fileName = this.generateOutpuFileName();
+////		fileName = "D:\\temp\\TEST_" + fileName;
+//		fileName = Configure.outputFileDirectory_Log + fileName;
+//		
+//		try{
+//			BufferedWriter writer = new BufferedWriter(new FileWriter(new File (fileName)));
+//			for (int i = 0; i < this.hitStringVector.size(); i ++){
+//				writer.write(hitStringVector.elementAt(i) + "\n");
+//			}
+//			
+//			writer.close();
+//		}catch(Exception e){
+//			e.printStackTrace();
+//		}
+	}
+	
+	//record missed DocIDs
+	void recordMissedDocID() throws IOException{
+		String filePath="";
+		if(Configure.RLZ){
+			filePath="D:\\WebExperiments\\MissedDocID_RLZ\\";
+		}
+		else{
+			filePath="D:\\WebExperiments\\MissedDocID_DC\\";
+		}
+	//	String fileName = generateOutpuFileName();
+		String fileName="";	
+		File f =new File(filePath);
+		f.mkdir();
+		fileName=filePath+generateOutpuFileName();//+"MissedDocID.txt";		
+		File f2 =new File(fileName);
+		if(f2.exists())f2.delete();
+		f2.createNewFile();
+		FileWriter write=new FileWriter(f2,true);
+		write.append(MissedDocID);
+		write.close();
+	}
+	//record missed DocIDs
+	void recordHitedDocID() throws IOException{
+		String filePath="";
+		if(Configure.RLZ){
+			filePath="D:\\WebExperiments\\HitedDocID_RLZ\\";
+		}
+		else{
+			filePath="D:\\WebExperiments\\HitedDocID_DC\\";
+		}
+		
+		String fileName="";	
+		File f =new File(filePath);
+		f.mkdir();
+		fileName=filePath+"HitedDocID.txt";		
+		File f2 =new File(fileName);
+		if(f2.exists())f2.delete();
+		f2.createNewFile();
+		FileWriter write=new FileWriter(f2,true);
+		write.append(HitedDoID);
+		write.close();
+	}
+	
+	// start searching
+	// warm the cache by the training data first
+	// then execute the queries in the testing data
+	public void queryStartEntry(){
+		
+		try {
+//			queryDocIDWriter = new BufferedWriter (new FileWriter (new File(Configure.QUERY_DOCID_TRAINING_WRITER_PATH)));
+			// step1: training
+			this.isTrain=true;
+			if(Configure.staticCache){
+				if (inputParameters.memoryLimitMB() > 0 && this.inputParameters.documentCacheTurnOn && this.inputParameters.isStaticCache(Configure.DC_DOCUMENT_CACHE)){
+					this.loadCache(Configure.DC_DOCUMENT_CACHE);
+				}
+				
+				if (inputParameters.memoryLimitMB() > 0 && this.inputParameters.RLZDocumentCacheTurnOn && this.inputParameters.isStaticCache(Configure.RLZDC_DOCUMENT_CACHE)){
+					this.loadCache(Configure.RLZDC_DOCUMENT_CACHE);
+				}
+				
+				if (inputParameters.memoryLimitMB() > 0 && this.inputParameters.CRLZDocumentCacheTurnOn && this.inputParameters.isStaticCache(Configure.CRLZDC_DOCUMENT_CACHE)){
+					this.loadCache(Configure.CRLZDC_DOCUMENT_CACHE);
+				}
+				
+				if (inputParameters.memoryLimitMB() > 0 && this.inputParameters.snippetCacheTurnOn && this.inputParameters.isStaticCache(Configure.SC_SNIPPET_CACHE)){
+					this.loadCache(Configure.SC_SNIPPET_CACHE);
+				}
+				
+				if (inputParameters.memoryLimitMB() > 0 && this.inputParameters.fragCacheTurnOn && this.inputParameters.isStaticCache(Configure.FC_FRAG_CACHE)){
+					this.loadCache(Configure.FC_FRAG_CACHE);
+				}
+			}
+			else this.trainingPhrase();
+//			queryDocIDWriter.close();
+			
+			
+	//		printOutCacheAfterTrain();
+			
+			// clear the cache statistics
+			resetCacheStatistics();	// clear the cache statistics
+			
+//			queryDocIDWriter = new BufferedWriter (new FileWriter (new File(Configure.QUERY_DOCID_TESTING_WRITER_PATH)));
+
+			// step2: testing
+			this.isTrain=false;
+			long t1 = System.nanoTime();
+			this.testingPhrase();
+			long t2 = System.nanoTime();
+			this.outputMeasurement.TimeOfTest = (double)(t2 - t1)/(double)1000000000.0f;
+			
+			// record missed docID on SSD
+			if(Configure.missedDocID)recordMissedDocID();
+			if(Configure.hitedDocID)recordHitedDocID();
+			// print out the run time info
+			printOutputInfo();
+			
+			this.closeSearch();
+			
+			printOutHitContent();
+			printOutHashMap();
+//			queryDocIDWriter.close();
+		} catch (Exception e) {
+			// TODO Auto-generated catch block
+			e.printStackTrace();
+		}
+	}
+	/*private void printOutContentLength(){
+		try {
+			String fileName = "ContentLength_"+this.generateOutpuFileName();
+//	      fileName = "D:\\temp\\TRAIN_" + fileName;
+	        fileName = Configure.outputFileDirectory + fileName;
+			
+			BufferedWriter writer = new BufferedWriter(new FileWriter(new File 
+					(fileName)));
+			
+			Iterator iter = this.DocumentContentLength.entrySet().iterator(); 
+			while (iter.hasNext()) { 
+			    Map.Entry entry = (Map.Entry) iter.next(); 
+			    int key = (Integer) entry.getKey();
+			    int value = (Integer) entry.getValue();
+			    writer.write(key + "\t" + value + "\n");
+			}
+			writer.close();
+			
+		} catch (Exception e) {
+			// TODO Auto-generated catch block
+			e.printStackTrace();
+		}
+	}*/
+	
+	private void printOutHashMap(){
+//		try {
+//			String fileName = Configure.outputFileDirectory_Log + "docAccessFrequency.txt";
+//			
+//			BufferedWriter writer = new BufferedWriter(new FileWriter(new File 
+//					(fileName)));
+//			
+//			Iterator iter = this.docHitMap.entrySet().iterator(); 
+//			while (iter.hasNext()) { 
+//			    Map.Entry entry = (Map.Entry) iter.next(); 
+//			    int key = (Integer) entry.getKey();
+//			    int value = (Integer) entry.getValue();
+//			    writer.write(key + "\t" + value + "\n");
+//			}
+//			writer.close();
+//			
+//			fileName = Configure.outputFileDirectory_Log + "snippetAccessFrequency.txt";
+//			writer = new BufferedWriter(new FileWriter(new File 
+//					(fileName)));
+//			iter = this.snipHitMap.entrySet().iterator(); 
+//			while (iter.hasNext()) { 
+//			    Map.Entry entry = (Map.Entry) iter.next(); 
+//			    int frequency = (Integer) entry.getValue();
+//			    String query = (String) entry.getKey();
+//			    int index = query.lastIndexOf("-");
+//			    if (index == -1){
+//			    	System.out.println(query);
+//			    	System.out.println(frequency);
+//			    }
+//			    String docID = query.substring(index + 1).trim();
+//			    writer.write(frequency + "\t" + docID + "\t" + query + "\n");
+//			}
+//			writer.close();
+//			
+//		} catch (Exception e) {
+//			// TODO Auto-generated catch block
+//			e.printStackTrace();
+//		}
+	}
+	
+	// given a file, run all the queries in the file
+	// this can be used to training data (warm cache) and testing data
+	private void runQueriesFromFile(String queryLogFilePath){
+		try{
+			totalPostingListHitLength = 0.0f;
+			totalNumOfPostingListHit = 0;
+			
+			outputMeasurement.numOfQueries = 0;
+			BufferedReader reader = new BufferedReader(new FileReader(new File (queryLogFilePath)));
+			String line = "";
+			while (true) {
+				line = reader.readLine();
+				if (line == null)	break;
+				
+				StringTokenizer tokenizer; 
+				tokenizer = new StringTokenizer(line, "\t");
+				Vector<String> tempStrVec = new Vector<String>();
+				
+				while (tokenizer.hasMoreTokens()) {
+					tempStrVec.add(tokenizer.nextToken()); 
+				}
+				
+				if (tempStrVec.size() < 1)	continue;
+				
+				// then, get the query in tempStrVec[2]
+				String queryStr = tempStrVec.elementAt(0);
+				//System.out.println(queryStr);
+				if (queryStr == null) continue;
+				if(tempStrVec.size()>=2){
+					List<Integer> topKDocIDs=new ArrayList<Integer>();
+					for(int i=1;i<tempStrVec.size();i++){
+						if(tempStrVec.elementAt(i)!=null){
+							topKDocIDs.add(Integer.parseInt(tempStrVec.elementAt(i)));
+						}
+					}					
+					this.currentQueryStr = queryStr;
+					this.individualQuery(queryStr,topKDocIDs);
+					topKDocIDs=null;
+				}				
+				
+				outputMeasurement.numOfQueries ++;
+				if (outputMeasurement.numOfQueries % 1000 == 0)
+					System.out.println(outputMeasurement.numOfQueries);
+				tokenizer=null;
+				tempStrVec=null;
+				queryStr=null;
+//				if (outputMeasurement.numOfQueries % 1000 == 0)
+//					System.out.println(outputMeasurement.numOfQueries);
+			}
+			reader=null;
+			line=null;
+			 
+		}catch(Exception e){
+			e.printStackTrace();
+		}
+	}
+	
+	// parse the query using IKAnalyzer
+	// input: a string
+	// output: Query object of Lucene
+	private Query parseQuery(String queryStr){
+		long t1 = System.nanoTime();
+		Query query = new BooleanQuery();
+		IKTokenizer tokenizer = new IKTokenizer(new StringReader(queryStr) , false);
+		try {
+			while(tokenizer.incrementToken()){
+				TermAttribute termAtt = tokenizer.getAttribute(TermAttribute.class);
+			    ((BooleanQuery) query).add(new TermQuery(new Term(Configure.ITEM_CONTENT, termAtt.term())), BooleanClause.Occur.MUST);
+			}
+		} catch (IOException e) {
+			// TODO Auto-generated catch block
+			e.printStackTrace();
+		}
+		long t2 = System.nanoTime();
+		double timeUsed = (double)(t2 - t1)/(double)1000000000.0f;
+		Search.outputMeasurement.parseTreeTime += timeUsed;
+//		Query query = new TermQuery (new Term(Configure.ITEM_CONTENT, queryStr));
+		return query;
+	}
+	
+	public String getfullsnippet(Document document, ArrayList posS, ArrayList posB, int fragstart, int fragend)
+	{
+		String result=new String();
+		//System.out.println("************##############");
+		//Document document     = this.getDocumentByID(docID);
+		String text			  = document.get(Configure.ITEM_CONTENT);
+	//	if(!this.isTrain)System.out.println(text.length());
+		StringBuilder newText = new StringBuilder();
+		String pr             = "<B>";
+		String af             = "</B>";
+		int end               = fragend;
+		int S;
+		int B;
+		String tokenText = "";
+		if(posS.isEmpty())
+			return "";
+		
+		S = (Integer) posS.get(0);
+		B = (Integer) posB.get(0);
+		if(S>text.length())S=text.length();
+		if(B>text.length())B=text.length();
+		if(end>text.length()){
+		//	System.out.print("fragend>=text.length");
+		//	System.out.println(end-text.length());
+		//	int docID=Integer.parseInt(document.get(Configure.ITEM_ID));
+		//	System.out.println(docID);
+			end=text.length();
+		}
+		if(fragstart>text.length())fragstart=text.length();
+		if(fragstart < S)
+		{
+			if(S>text.length())S=text.length();
+			if(fragstart>text.length())fragstart=text.length();
+			tokenText = text.substring(fragstart,S);
+			newText.append(tokenText);
+		}
+		
+		newText.append(pr);
+		if(S>text.length())S=text.length();
+		if(B>text.length())B=text.length();
+		tokenText = text.substring(S,B);
+		newText.append(tokenText);
+		newText.append(af);
+		
+		
+		for(int index = 1 ; index < posS.size(); index++)
+		{
+			
+			S = (Integer) posS.get(index);
+			if(S>text.length())S=text.length();
+			if(B>text.length())B=text.length();
+			tokenText = text.substring(B, S);
+			newText.append(tokenText);
+			
+			B = (Integer) posB.get(index);
+			newText.append(pr);
+			if(S>text.length())S=text.length();
+			if(B>text.length())B=text.length();
+			tokenText = text.substring(S,B);
+			newText.append(tokenText);
+			newText.append(af);
+
+		}
+		if(B < end)
+		{
+			if(end>text.length())end=text.length();
+			if(B>text.length())B=text.length();
+			tokenText = text.substring(B, end);
+			newText.append(tokenText);	
+		}
+		
+		result = newText.toString();
+		text=null;
+		newText=null;
+		pr=null;
+		af=null;
+		tokenText=null;
+		return result;
+		
+	}
+
+	
+	// step2: generate snippets by docIDs and the query
+	// we can add snippet cache
+	private Snippet getSnippetsByDocIDAndQuery(int docID, Query query){
+		Snippet tempSnippet = null;
+		Frag tempFrag       = null;		
+		try{
+			String key = this.generateQueryBiasedSnippetKey(query, docID);
+			
+			// check the snippet cache first
+		    if (inputParameters.snippetCacheTurnOn  && inputParameters.memoryLimitMB() > 0)
+				tempSnippet = this.snippetCache.get(key);
+		    //snippet cache miss
+		    if(tempSnippet==null){
+		    	double time = 0;
+		    	Document document = this.getDocumentByID(docID);
+		    	//fragment cache on
+		    	if(inputParameters.fragCacheTurnOn  && inputParameters.memoryLimitMB() > 0){	    		
+					//then check frag cache
+					if(inputParameters.fragCacheTurnOn  && inputParameters.memoryLimitMB() > 0){
+			     		tempFrag = this.fragCache.get(key);
+					}						
+					
+					if(tempFrag == null){
+						//generate frag first
+						long t0 = System.nanoTime();
+						
+						tempFrag = this.generateFrag(document, query);
+						tempFrag.setDocid(docID);
+						
+						long t1 = System.nanoTime();
+						time = (double)(t1 - t0)/1000000000.0f;
+					//	if(!this.isTrain)this.outputMeasurement.TimeOfGenerateSnippetInTest+=time;					
+						// update frag cache
+						if (this.inputParameters.fragCacheTurnOn && this.inputParameters.memoryLimitMB() > 0){
+							int tempNumBytes = RAMEstimator.INT_NUM_BYTE + RAMEstimator.getNumBytesOfFrag(tempFrag);
+							//System.out.println(tempNumBytes);
+							CacheNode<String, Frag> tempNode = new CacheNode<String, Frag>(key, tempFrag, tempNumBytes);
+							tempNode.cost = time;
+							this.fragCache.put(tempNode);
+							tempNode=null;
+						}
+						
+					}
+			//		outputMeasurement.totalFragLen+=RAMEstimator.INT_NUM_BYTE + RAMEstimator.getNumBytesOfFrag(tempFrag);
+			//		outputMeasurement.totalFragNum+=1;
+					tempSnippet = new Snippet();
+					long t3 = System.nanoTime();
+					//if(tempSnippet == null) System.out.println("*********          ");
+					tempSnippet.setSummarization(getfullsnippet(document,
+							tempFrag.getStart(),tempFrag.getEnd(),tempFrag.getfragstart(),tempFrag.getfragend()));
+					tempSnippet.setTitle(document.get(Configure.ITEM_TITLE));
+					tempSnippet.setUrl(document.get(Configure.ITEM_URL));
+					long t4 = System.nanoTime();
+					
+					time += (double)(t4 - t3)/1000000000.0f;; 
+					if(!this.isTrain)this.outputMeasurement.TimeOfGenerateSnippetInTest+=time;
+					assert tempSnippet != null;
+					tempFrag=null;
+					document=null;
+					key=null;
+		    	}
+		    	// no fragment cache
+		    	else{
+		    		long t0 = System.nanoTime();
+					// cache miss, search it in normal way
+					if (tempSnippet == null){	
+						tempSnippet = this.generateSnippet(document, query);
+					//	tempSnippet.setDocid(docID);
+					}
+					long t1 = System.nanoTime();
+					time = (double)(t1 - t0)/1000000000.0f;
+					if(!this.isTrain)this.outputMeasurement.TimeOfGenerateSnippetInTest+=time;
+					
+					assert tempSnippet != null;
+		    	}
+		    	// update snippet cache
+				if (this.inputParameters.snippetCacheTurnOn && this.inputParameters.memoryLimitMB() > 0){
+					int tempNumBytes = RAMEstimator.INT_NUM_BYTE + RAMEstimator.getNumBytesOfSnippet(tempSnippet);
+					//System.out.println(tempNumBytes);
+					CacheNode<String, Snippet> tempNode = new CacheNode<String, Snippet>(key, tempSnippet, tempNumBytes);
+					tempNode.cost = time;
+					this.snippetCache.put(tempNode);
+				}
+		    }
+		}catch(Exception e){
+			e.printStackTrace();
+		}
+		 
+		return tempSnippet;
+	}
+	
+	/**
+	 * long startTime = System.nanoTime();
+
+double totalTime = (double)(endTime - startTime)/(double)1000000000.0f;	//seconds
+this.outputMeasurement.totalRunTime = totalTime;
+	 * @param queryStr
+	 */
+	// handle and forward an individual query
+	private void individualQuery(String queryStr,List<Integer> topKDocIDs) throws IOException{
+		// parse query
+		Query query = parseQuery(queryStr);
+		long t1 = System.nanoTime();
+		
+		List<Snippet> topKResults = getQueryResults(query,topKDocIDs);
+		long t2 = System.nanoTime();
+		this.outputMeasurement.topKResultDocIDListTime += (double)(t2 - t1)/(double)1000000000.0f;	//seconds
+		
+		// display results to users
+//		display(topKResults, queryStr, query);
+//		outputResult(topKResults, queryStr, query);
+		query=null;
+		
+	}
+	
+	private List<Integer> getDocIDs(Query query){
+		List<Integer> topDocIDs = null;
+		return topDocIDs;
+	}
+	
+	// input: query string
+	// output: top-k docID list
+	private List<Snippet> getQueryResults(Query query,List<Integer> topKDocIDs){
+		try{
+			List<Snippet> topKResults = null;
+
+			// check query result cache first
+			if (inputParameters.resultCacheTurnOn && inputParameters.memoryLimitMB() > 0)
+				topKResults = this.resultCache.get(query);
+			
+			// if cache miss, execute it as normal query
+			if (topKResults == null){
+				topKResults = new ArrayList<Snippet>();
+				
+				int numOfBytes_snippet = 0;
+				
+//				this.queryDocIDWriter.write(this.currentQueryStr);
+				
+				for (int docID : topKDocIDs){
+					
+//					this.queryDocIDWriter.write("\t" + String.valueOf(docID));
+					
+					long t3 = System.nanoTime();
+					Snippet tempSnippet = this.getSnippetsByDocIDAndQuery(docID, query);
+	
+
+					long t4 = System.nanoTime();
+					this.outputMeasurement.topKResultSnippetListTime += (double)(t4 - t3)/(double)1000000000.0f;
+					
+					numOfBytes_snippet += RAMEstimator.getNumBytesOfSnippet(tempSnippet);
+					topKResults.add(tempSnippet);
+					tempSnippet=null;
+				}
+//				this.queryDocIDWriter.write("\n");
+//				this.queryDocIDWriter.flush();
+
+				// update the result cache
+				if (inputParameters.resultCacheTurnOn  && inputParameters.memoryLimitMB() > 0 && topKResults.size() > 0){
+					// the result cache key takes 4 bytes
+					// the result cache value takes 4 * size() bytes
+					int tmepNumBytes = RAMEstimator.INT_NUM_BYTE + numOfBytes_snippet;
+					CacheNode<Query, List<Snippet>> tempNode = new CacheNode<Query, List<Snippet>>(query, topKResults, tmepNumBytes);
+					this.resultCache.put(tempNode);
+					tempNode=null;
+				}			
+			}
+			 
+			return topKResults;
+		} catch (Exception e){
+			e.printStackTrace();
+			return null;
+		}
+	}
+	public int readInt(DataInputStream in) throws IOException {
+        int ch1 = in.read();
+        int ch2 = in.read();
+        int ch3 = in.read();
+        int ch4 = in.read();
+        if ((ch1 | ch2 | ch3 | ch4) < 0)
+            throw new EOFException();
+        return ((ch4 << 24) + (ch3 << 16) + (ch2 << 8) + (ch1 << 0));
+    }
+	String findPath(int id){
+		//D:\RLZ\dict256MOutput\0\0\0\14.txt
+		String s;
+		int BigFileNumber=id/1000000;
+		int smallFileNumber=(id/1000)%1000;
+		s="D:\\RLZ\\dict128MOutput\\"+BigFileNumber+"\\"+BigFileNumber+"\\"+smallFileNumber+"\\"+id+".txt";
+		return s;
+	}
+	String findDocPath(int id){
+		//D:\rawContent\0\0\0\14.txt
+		String s;
+		int BigFileNumber=id/1000000;
+		int smallFileNumber=(id/1000)%1000;
+		s="D:\\rawContent\\"+BigFileNumber+"\\"+BigFileNumber+"\\"+smallFileNumber+"\\"+id+".txt";
+		return s;
+	}
+	String findCRLZPath(int id){
+		String path="";
+		path="D:\\RLZ\\"+id+"_zv.txt";
+		return path;
+	}
+	void setDocTitleandURl(int id,Document d) throws IOException{
+		Field fieldID = new Field(Configure.ITEM_ID, id + "", Field.Store.YES, Field.Index.NOT_ANALYZED);
+		String pathTitle;
+		String pathURL;
+		int BigFileNumber=id/1000000;
+		int smallFileNumber=(id/1000)%1000;
+		pathTitle="D:\\SougouDocumentTitle\\"+BigFileNumber+"\\"+smallFileNumber+"\\"+id+".txt";
+		pathURL="D:\\SougouDocumentURL\\"+BigFileNumber+"\\"+smallFileNumber+"\\"+id+".txt";
+		File file1=new File (pathTitle);
+		BufferedReader reader1 = new BufferedReader(new FileReader(file1));
+		Long filelength = file1.length();  
+		// set the title field
+		TermVector tv = Field.TermVector.NO;
+		tv = Field.TermVector.WITH_POSITIONS_OFFSETS;
+		Field fieldTitle = null;
+		if(filelength>=0){
+	//		byte[] filecontent = new byte[filelength.intValue()];  
+	        FileInputStream in = new FileInputStream(file1);  
+	        in.read(titleContent,0,filelength.intValue());  
+	        in.close(); 
+	        fieldTitle = new Field(Configure.ITEM_TITLE, 
+	        		new String(titleContent,0,filelength.intValue()),
+	        		Field.Store.YES, Field.Index.ANALYZED, tv);
+		}
+		else{
+			fieldTitle = new Field(Configure.ITEM_TITLE, "",
+	        		Field.Store.YES, Field.Index.ANALYZED, tv);
+		}
+        File file2=new File (pathURL);
+        BufferedReader reader2 = new BufferedReader(new FileReader(file2));
+ 	    Long filelength2 = file2.length();  
+ 	    Field fieldURL=null;
+ 	    if(filelength2>=0){
+ 	   // 	byte[] filecontent2 = new byte[filelength2.intValue()];  
+ 	        FileInputStream in2 = new FileInputStream(file2);  
+ 	        in2.read(urlContent,0,filelength2.intValue());  
+ 	        in2.close();  
+ 	    // set the url field
+ 			fieldURL = new Field(Configure.ITEM_URL, 
+ 					new String(urlContent,0,filelength2.intValue()),
+ 					Field.Store.YES, Field.Index.NOT_ANALYZED);
+ 	    }
+ 	    else{
+ 	    	fieldURL = new Field(Configure.ITEM_URL, "",
+					Field.Store.YES, Field.Index.NOT_ANALYZED);
+ 	    } 	    		
+		d.add(fieldID);
+		d.add(fieldURL);
+		d.add(fieldTitle);
+		fieldID=null;
+		fieldURL=null;
+		fieldTitle=null;
+		tv=null;
+		
+ 	    file1=null;
+ 	    file2=null;
+ 	    reader1=null;
+ 	    reader2=null;
+ 	    pathTitle=null;
+ 	    pathURL=null;
+	}
+	void getTitleandURl(int id,CompressedRLZ cd) throws IOException{
+		String pathTitle;
+		String pathURL;
+		int BigFileNumber=id/1000000;
+		int smallFileNumber=(id/1000)%1000;
+		pathTitle="D:\\SougouDocumentTitle\\"+BigFileNumber+"\\"+smallFileNumber+"\\"+id+".txt";
+		pathURL="D:\\SougouDocumentURL\\"+BigFileNumber+"\\"+smallFileNumber+"\\"+id+".txt";
+		File file1=new File (pathTitle);
+		BufferedReader reader1 = new BufferedReader(new FileReader(file1));
+		Long filelength = file1.length();  
+		if(filelength>=0){
+	//		byte[] filecontent = new byte[filelength.intValue()];  
+	        FileInputStream in = new FileInputStream(file1);  
+	        in.read(titleContent,0,filelength.intValue());  
+	        in.close();  
+	        cd.title= new String(titleContent,0,filelength.intValue());
+		}
+		else{cd.title=new String();cd.title="";}
+        File file2=new File (pathURL);
+        BufferedReader reader2 = new BufferedReader(new FileReader(file2));
+ 	    Long filelength2 = file2.length();  
+ 	    if(filelength2>=0){
+ 	   // 	byte[] filecontent2 = new byte[filelength2.intValue()];  
+ 	        FileInputStream in2 = new FileInputStream(file2);  
+ 	        in2.read(urlContent,0,filelength2.intValue());  
+ 	        in2.close();  
+ 	        cd.URL= new String(urlContent,0,filelength2.intValue());
+ 	    }
+ 	    else{cd.URL=new String();cd.URL="";}
+ 	    file1=null;
+ 	    file2=null;
+ 	    reader1=null;
+ 	    reader2=null;
+ 	    pathTitle=null;
+ 	    pathURL=null;
+	}
+	void getTitleandURl(int id,CompressedDocument cd) throws IOException{
+		String pathTitle;
+		String pathURL;
+		int BigFileNumber=id/1000000;
+		int smallFileNumber=(id/1000)%1000;
+		pathTitle="D:\\SougouDocumentTitle\\"+BigFileNumber+"\\"+smallFileNumber+"\\"+id+".txt";
+		pathURL="D:\\SougouDocumentURL\\"+BigFileNumber+"\\"+smallFileNumber+"\\"+id+".txt";
+		File file1=new File (pathTitle);
+		BufferedReader reader1 = new BufferedReader(new FileReader(file1));
+		Long filelength = file1.length();  
+		if(filelength>=0){
+	//		byte[] filecontent = new byte[filelength.intValue()];  
+	        FileInputStream in = new FileInputStream(file1);  
+	        in.read(titleContent,0,filelength.intValue());  
+	        in.close();  
+	        cd.title= new String(titleContent,0,filelength.intValue());
+		}
+		else{cd.title=new String();cd.title="";}
+        File file2=new File (pathURL);
+        BufferedReader reader2 = new BufferedReader(new FileReader(file2));
+ 	    Long filelength2 = file2.length();  
+ 	    if(filelength2>=0){
+ 	   // 	byte[] filecontent2 = new byte[filelength2.intValue()];  
+ 	        FileInputStream in2 = new FileInputStream(file2);  
+ 	        in2.read(urlContent,0,filelength2.intValue());  
+ 	        in2.close();  
+ 	        cd.url= new String(urlContent,0,filelength2.intValue());
+ 	    }
+ 	    else{cd.url=new String();cd.url="";}
+ 	    file1=null;
+ 	    file2=null;
+ 	    reader1=null;
+ 	    reader2=null;
+ 	    pathTitle=null;
+ 	    pathURL=null;
+	}
+	/*int changeByteToInt(byte[] b, int position) throws EOFException{
+		//int ch1 = (int)b[position];
+        //int ch2 = (int)b[position+1];
+        //int ch3 = (int)b[position+2];
+        //int ch4 = (int)b[position+3];
+        //if ((ch1 | ch2 | ch3 | ch4) < 0){
+         //   throw new EOFException()
+        	System.out.println(position);
+        System.out.println(ch1);
+        System.out.println(ch2);
+        System.out.println(ch3);
+        System.out.println(ch4);
+        System.out.println(b[position]);
+        System.out.println(b[position+1]);
+        System.out.println(b[position+1]);
+        System.out.println(b[position+1]);
+        //}
+        
+        //return ((ch4 << 24) + (ch3 << 16) + (ch2 << 8) + (ch1 << 0));
+		int num = (b[position] & 0xff) |(b[position+1] << 8) |
+				(b[position+2] << 16) |	(b[position+3] << 24);
+		System.out.println(num);
+		return num;
+	}*/
+	public static int byteArrayToInt(byte[] bytes,int position) {
+        int value= 0;
+        //由高位到低位
+        for (int i = 0; i < 4; i++) {
+            int shift= (4 - 1 - i) * 8;
+            value +=(bytes[position+3-i] & 0x000000FF) << shift;//往高位游
+        }
+        return value;
+  }
+	Document getDocumentFromSSD(int docID) throws IOException{
+		Document d = new Document();
+		setDocTitleandURl(docID,d);
+		// read binary form compressed document from SSD
+		String path= findDocPath(docID);
+		TermVector tv = Field.TermVector.NO;
+		tv = Field.TermVector.WITH_POSITIONS_OFFSETS;
+
+        Store contentStore = Field.Store.NO;
+		contentStore = Field.Store.YES;
+		
+		File file1 = new File(path);  
+	    Long filelength = file1.length();  
+	    Field fieldContent=null;
+	    byte[] url=d.get(Configure.ITEM_URL).getBytes();
+		byte[] title=d.get(Configure.ITEM_TITLE).getBytes();
+//		byte[] tc=new byte[this.DocumentContentLength.get(id)+url.length+1];
+		int tcindex=0;
+		int position=0;
+		System.arraycopy(url, 0, tc, tcindex, url.length);
+		tcindex+=url.length;
+		url=null;
+		
+		System.arraycopy(title, 0, tc, tcindex, title.length);
+		tcindex+=title.length;
+		title=null;
+	    if(filelength>=0){
+	    	FileInputStream in = new FileInputStream(file1);  
+		    in.read(filecontent,0,filelength.intValue()); 
+		    System.arraycopy(filecontent, 0, tc, tcindex, filelength.intValue());
+		    tcindex+=filelength.intValue();
+	        in.close();	
+			fieldContent = new Field(Configure.ITEM_CONTENT,
+					new String(new String(tc,0,tcindex)), 
+					contentStore, Field.Index.ANALYZED, tv);
+			in=null;
+	    }
+	    else{
+	    	fieldContent = new Field(Configure.ITEM_CONTENT,"", 
+					contentStore, Field.Index.ANALYZED, tv);
+	    }
+	    d.add(fieldContent);
+	//   System.out.println(filelength.intValue());
+    //   filecontent = new byte[filelength.intValue()];  
+	    
+		contentStore=null;
+		tv=null;
+		fieldContent=null;
+		path=null;
+		file1=null;
+		
+		return d;
+	}
+	
+	// used for RLZ
+	public CompressedRLZ getCompressedRLZ(int id) throws IOException{
+		CompressedRLZ crlz=new CompressedRLZ();
+		getTitleandURl(id,crlz);
+		String path=this.findCRLZPath(id);
+		File file1 = new File(path);  
+		Long filelength = file1.length();  
+		if(filelength>=0){
+		    FileInputStream in = new FileInputStream(file1); 
+			in.read(filecontent,0,filelength.intValue()); 
+			in.close();	
+		    //    System.out.println(filecontent.length);
+		    int position=0;
+		     //   byte[] tempb= new byte[4];
+		     //   System.arraycopy(filecontent,position,tempb,0,4);
+		     //   cd.pairNumber=Integer.parseInt(new String(tempb));
+		    crlz.pairNumber=this.byteArrayToInt(filecontent, position);
+		   //     System.out.println("pairNumber:"+cd.pairNumber);
+		    position+=4;
+		    crlz.positionLength=this.byteArrayToInt(filecontent, position);
+		    position+=4;
+		    crlz.positions= new byte[crlz.positionLength];
+		    System.arraycopy(filecontent, position, crlz.positions, 0, crlz.positionLength);
+		    position+=crlz.positionLength;
+		    crlz.lengthLength=this.byteArrayToInt(filecontent, position);
+		    position+=4;
+		    crlz.lengths=new byte[crlz.lengthLength];
+		    System.arraycopy(filecontent, position, crlz.lengths, 0, crlz.lengthLength); 
+			in=null;
+		 }
+		return crlz;
+	}
+	
+	CompressedDocument getCompressedDocumentFromSSD(int docID) throws IOException{
+		CompressedDocument cd = new CompressedDocument();
+		// read binary form compressed document from SSD
+		String path= findPath(docID);
+		
+		File file1 = new File(path);  
+	    Long filelength = file1.length();  
+	//   System.out.println(filelength.intValue());
+    //   filecontent = new byte[filelength.intValue()];  
+	    FileInputStream in = new FileInputStream(file1);  
+	    in.read(filecontent,0,filelength.intValue());  
+        in.close();	
+    //    System.out.println(filecontent.length);
+        int position=0;
+     //   byte[] tempb= new byte[4];
+     //   System.arraycopy(filecontent,position,tempb,0,4);
+     //   cd.pairNumber=Integer.parseInt(new String(tempb));
+        cd.pairNumber=this.byteArrayToInt(filecontent, position);
+   //     System.out.println("pairNumber:"+cd.pairNumber);
+        position+=4;
+        for(int i=0;i<cd.pairNumber;i++){
+			cd.position.add(byteArrayToInt(filecontent, position));
+			position+=4;
+		}
+		for(int i=0;i<cd.pairNumber;i++){
+			cd.length.add((short)byteArrayToInt(filecontent, position));
+			position+=4;
+		}
+		
+		/*DataInputStream reader = new DataInputStream(new FileInputStream(new File (path)));
+		cd.pairNumber=readInt(reader);
+		for(int i=0;i<cd.pairNumber;i++){
+			cd.position.add(readInt(reader));
+		}
+		for(int i=0;i<cd.pairNumber;i++){
+			cd.length.add((short)readInt(reader));
+		}*/
+		getTitleandURl(docID,cd);
+		path=null;
+	//	filecontent=null;
+		file1=null;
+		in=null;
+		return cd;
+	}
+	public static int decode_vbyte(byte []buffer, int buf_idx, int []output, int opt_idx) {
+		int nbytes = 0;
+		int shift = 0;
+		int b;
+		while (true) {
+			b = buffer[buf_idx + nbytes];
+			nbytes++;
+			output[opt_idx] += (b & 127) << shift;
+			shift += 7;
+			if ((b&128) == 0)
+				break;
+		}
+		return nbytes;
+	}
+	Document decompressDocumentFromCRLZ(int id,CompressedRLZ cd) throws DataFormatException{
+		Document doc = new Document();
+		// set the docID field
+		Field fieldID = new Field(Configure.ITEM_ID, id + "", Field.Store.YES, Field.Index.NOT_ANALYZED);
+		// set the url field
+		Field fieldURL = new Field(Configure.ITEM_URL, cd.URL, Field.Store.YES, Field.Index.NOT_ANALYZED);
+		// set the title field
+		TermVector tv = Field.TermVector.NO;
+		tv = Field.TermVector.WITH_POSITIONS_OFFSETS;
+		Field fieldTitle = new Field(Configure.ITEM_TITLE, cd.title, Field.Store.YES, Field.Index.ANALYZED, tv);
+		// set the content field
+		byte[] url=cd.URL.getBytes();
+		byte[] title=cd.title.getBytes();
+//		byte[] tc=new byte[this.DocumentContentLength.get(id)+url.length+1];
+		int tcindex=0;
+		int position=0;
+		int length=0;
+		System.arraycopy(url, 0, tc, tcindex, url.length);
+		tcindex+=url.length;
+		url=null;
+		
+		System.arraycopy(title, 0, tc, tcindex, title.length);
+		tcindex+=title.length;
+		title=null;
+		// decompress position
+		Inflater inflater = new Inflater();   
+		inflater.setInput(cd.positions);  
+		int count = inflater.inflate(buffer); 
+		int p=0;
+		// decompress length
+        int nbytes = 0;
+	    int i = 0;
+	    int output[] = new int[cd.pairNumber];  
+	    while (nbytes < cd.lengthLength) {
+	    	nbytes += decode_vbyte(cd.lengths, nbytes, output, i);
+	    	i++;
+	    }
+	    long t1=System.nanoTime();
+		for(int j=0;j<cd.pairNumber;j++){
+			position=byteArrayToInt(buffer, p);
+			length=(short) output[j];
+			p+=4;
+			if(length!=0){
+				if(position+length<this.RLZDirectiory.length){
+					System.arraycopy(RLZDirectiory, position, tc, tcindex, length);
+					tcindex+=length;
+				}
+				else{
+					if(position<this.RLZDirectiory.length){
+						length=this.RLZDirectiory.length-position;
+						System.arraycopy(RLZDirectiory, position, tc, tcindex, length);
+						tcindex+=length;
+					}						
+				}
+			}
+			else{				
+				tc[tcindex++]=(byte)position;
+			}
+		}
+		long t2=System.nanoTime();
+		double time= (double)(t2 - t1)/(double)1000000000.0f;
+		if(!this.isTrain)this.outputMeasurement.TimeOfStringCopyInDecompressInTest+=time;
+
+		
+		String content=new String(tc,0,tcindex);
+		
+		Store contentStore = Field.Store.NO;
+		contentStore = Field.Store.YES;
+		Field fieldContent = new Field(Configure.ITEM_CONTENT, content, contentStore, Field.Index.ANALYZED, tv);
+		content=null;
+		contentStore=null;
+		tv=null;
+		
+		// add all
+		doc.add(fieldID);
+		doc.add(fieldURL);
+		doc.add(fieldTitle);
+		doc.add(fieldContent);
+		fieldID=null;
+		fieldURL=null;
+		fieldTitle=null;
+		fieldContent=null;
+		
+
+		return doc;
+	}
+	Document decompressDocument(int id, CompressedDocument cd) throws CorruptIndexException, IOException{
+		// decompress document by RLZ dictionary and compressed document
+		Document doc = new Document();
+	//	int contentLength=0;
+	//	if(this.DocumentContentLength.get(id)!=null)contentLength=this.DocumentContentLength.get(id);
+		
+	//	if(contentLength==6){
+	//		doc=searcher.doc(id);
+	//	}
+	//	else{
+			// set the docID field
+			Field fieldID = new Field(Configure.ITEM_ID, id + "", Field.Store.YES, Field.Index.NOT_ANALYZED);
+			
+			// set the url field
+			Field fieldURL = new Field(Configure.ITEM_URL, cd.url, Field.Store.YES, Field.Index.NOT_ANALYZED);
+			
+			// set the title field
+			TermVector tv = Field.TermVector.NO;
+			tv = Field.TermVector.WITH_POSITIONS_OFFSETS;
+			Field fieldTitle = new Field(Configure.ITEM_TITLE, cd.title, Field.Store.YES, Field.Index.ANALYZED, tv);
+			
+			// set the content field
+			
+			String content=new String();
+			
+			byte[] url=cd.url.getBytes();
+			byte[] title=cd.title.getBytes();
+	//		byte[] tc=new byte[this.DocumentContentLength.get(id)+url.length+1];
+			int tcindex=0;
+			int position=0;
+			int length=0;
+			System.arraycopy(url, 0, tc, tcindex, url.length);
+			tcindex+=url.length;
+			url=null;
+			
+			System.arraycopy(title, 0, tc, tcindex, title.length);
+			tcindex+=title.length;
+			title=null;
+		/*	for(int i=0;i<url.length;i++){	
+				tc[tcindex++]=url[i];
+			}*/
+			long t1=System.nanoTime();
+			for(int i=0;i<cd.pairNumber;i++){
+				position=cd.position.get(i);
+				length=cd.length.get(i);
+				if(length!=0){
+					if(position+length<this.RLZDirectiory.length){
+						System.arraycopy(RLZDirectiory, position, tc, tcindex, length);
+						tcindex+=length;
+					}
+					else{
+						if(position<this.RLZDirectiory.length){
+							length=this.RLZDirectiory.length-position;
+							System.arraycopy(RLZDirectiory, position, tc, tcindex, length);
+							tcindex+=length;
+						}						
+					}
+					/*for(int j=position;j<position+length&&j<this.RLZDirectiory.length;j++){
+						try{
+						//	if(j>=this.RLZDirectiory.length)break;
+							tc[tcindex++]=this.RLZDirectiory[j];
+						}catch(ArrayIndexOutOfBoundsException e){
+							System.out.println("DocID:"+id);
+							System.out.println("position:"+position);
+							System.out.println("length:"+length);
+							System.out.println("j:"+j);
+							System.out.println("Dictionary length:"+this.RLZDirectiory.length);
+						//	System.out.println(this.RLZDirectiory[j]);				
+							System.out.println("tcindex:"+tcindex);
+							System.out.println("tc length:"+tc.length);
+						}
+						
+					}*/
+				}
+				else{				
+					tc[tcindex++]=(byte)position;
+				}
+			}
+			long t2=System.nanoTime();
+			double time= (double)(t2 - t1)/(double)1000000000.0f;
+			if(!this.isTrain)this.outputMeasurement.TimeOfStringCopyInDecompressInTest+=time;
+	
+			
+			content=new String(tc,0,tcindex);
+			
+			
+		//	tc=new byte[3*1024*1024];
+		//	tc=null;
+			Store contentStore = Field.Store.NO;
+			contentStore = Field.Store.YES;
+			Field fieldContent = new Field(Configure.ITEM_CONTENT, content, contentStore, Field.Index.ANALYZED, tv);
+			content=null;
+			contentStore=null;
+			tv=null;
+			// set the file path field
+//			Field fieldPath = new Field(Configure.ITEM_PATH, item.getPath(), Field.Store.YES, Field.Index.NOT_ANALYZED);
+			
+			// set the position info
+//			if (this.isStorePositionInfo == false){
+//				fieldID.setOmitTermFreqAndPositions(true);
+//				fieldURL.setOmitTermFreqAndPositions(true);
+//				fieldTitle.setOmitTermFreqAndPositions(true);
+//				fieldContent.setOmitTermFreqAndPositions(true);
+//				fieldPath.setOmitTermFreqAndPositions(true);
+//			}
+
+
+			// add all
+			doc.add(fieldID);
+			doc.add(fieldURL);
+			doc.add(fieldTitle);
+			doc.add(fieldContent);
+			fieldID=null;
+			fieldURL=null;
+			fieldTitle=null;
+			fieldContent=null;
+//			doc.add(fieldPath);
+	//	}
+		return doc;
+	}
+	void testArrayCopySpeed(int docID) throws CorruptIndexException, IOException{
+		Document dd=searcher.doc(docID);
+		CompressedDocument cd=this.getCompressedDocumentFromSSD(docID);
+		long t1 = System.nanoTime();
+		for(int i=0;i<100000;i++){
+			Document d= this.decompressDocument(docID, cd);
+		}
+		long t2 = System.nanoTime();
+		double time1= (double)(t2 - t1)/(double)1000000000.0f;
+		System.out.println("copy time:"+time1);
+		long t3 = System.nanoTime();
+		for(int i=0;i<100000;i++){
+		//	Document d= this.decompressDocument(docID, cd);
+			
+			Document doc = new Document();
+			//	int contentLength=0;
+			//	if(this.DocumentContentLength.get(id)!=null)contentLength=this.DocumentContentLength.get(id);
+				
+			//	if(contentLength==6){
+			//		doc=searcher.doc(id);
+			//	}
+			//	else{
+					// set the docID field
+					Field fieldID = new Field(Configure.ITEM_ID, docID + "", Field.Store.YES, Field.Index.NOT_ANALYZED);
+					
+					// set the url field
+					Field fieldURL = new Field(Configure.ITEM_URL, cd.url, Field.Store.YES, Field.Index.NOT_ANALYZED);
+					
+					// set the title field
+					TermVector tv = Field.TermVector.NO;
+					tv = Field.TermVector.WITH_POSITIONS_OFFSETS;
+					Field fieldTitle = new Field(Configure.ITEM_TITLE, cd.title, Field.Store.YES, Field.Index.ANALYZED, tv);
+					
+					// set the content field
+					String content=new String();
+					
+					byte[] url=cd.url.getBytes();
+			//		byte[] tc=new byte[this.DocumentContentLength.get(id)+url.length+1];
+					int tcindex=0;
+					int position=0;
+					int length=0;
+				//	System.arraycopy(url, 0, tc, tcindex, url.length);
+				//	tcindex+=url.length;
+					for(int k=0;k<url.length;k++){	
+						tc[tcindex++]=url[k];
+					}
+					for(int j=0;j<cd.pairNumber;j++){
+						position=cd.position.get(j);
+						length=cd.length.get(j);
+						if(length!=0){
+							/*if(position+length<this.RLZDirectiory.length){
+								System.arraycopy(RLZDirectiory, position, tc, tcindex, length);
+								tcindex+=length;
+							}
+							else{
+								if(position<this.RLZDirectiory.length){
+									length=this.RLZDirectiory.length-position;
+									System.arraycopy(RLZDirectiory, position, tc, tcindex, length);
+									tcindex+=length;
+								}						
+							}*/
+							for(int p=position;p<position+length&&p<this.RLZDirectiory.length;p++){
+								try{
+								//	if(j>=this.RLZDirectiory.length)break;
+									tc[tcindex++]=this.RLZDirectiory[p];
+								}catch(ArrayIndexOutOfBoundsException e){
+									System.out.println("DocID:"+docID);
+									System.out.println("position:"+position);
+									System.out.println("length:"+length);
+									System.out.println("p:"+p);
+									System.out.println("Dictionary length:"+this.RLZDirectiory.length);
+								//	System.out.println(this.RLZDirectiory[j]);				
+									System.out.println("tcindex:"+tcindex);
+									System.out.println("tc length:"+tc.length);
+								}
+								
+							}
+						}
+						else{				
+							tc[tcindex++]=(byte)position;
+						}
+					}
+			
+					
+					content=new String(tc,0,tcindex);
+					tc=new byte[3*1024*1024];
+				//	tc=null;
+					Store contentStore = Field.Store.NO;
+					contentStore = Field.Store.YES;
+					Field fieldContent = new Field(Configure.ITEM_CONTENT, content, contentStore, Field.Index.ANALYZED, tv);
+					content=null;
+					// set the file path field
+//					Field fieldPath = new Field(Configure.ITEM_PATH, item.getPath(), Field.Store.YES, Field.Index.NOT_ANALYZED);
+					
+					// set the position info
+//					if (this.isStorePositionInfo == false){
+//						fieldID.setOmitTermFreqAndPositions(true);
+//						fieldURL.setOmitTermFreqAndPositions(true);
+//						fieldTitle.setOmitTermFreqAndPositions(true);
+//						fieldContent.setOmitTermFreqAndPositions(true);
+//						fieldPath.setOmitTermFreqAndPositions(true);
+//					}
+
+
+					// add all
+					doc.add(fieldID);
+					doc.add(fieldURL);
+					doc.add(fieldTitle);
+					doc.add(fieldContent);
+//					doc.add(fieldPath);
+		}
+		long t4 = System.nanoTime();
+		double time2= (double)(t4 - t3)/(double)1000000000.0f;
+		System.out.println("fuzhi time:"+time2);
+	}
+	//used for test CRLZ
+	void testCRLZ(int docID) throws IOException, DataFormatException{
+		Document dd=null;
+		if(Configure.DocApi)dd=searcher.doc(docID);
+		else dd=getDocumentFromSSD(docID);
+		CompressedRLZ cd=this.getCompressedRLZ(docID);
+		Document d= this.decompressDocumentFromCRLZ(docID, cd);
+		String content = d.get(Configure.ITEM_CONTENT);
+		String contentd = dd.get(Configure.ITEM_CONTENT);
+		byte[]db=content.getBytes();
+		byte[]ddb=contentd.getBytes();
+		/*for(int i=0;i<db.length;i++){
+			System.out.print(db[i]+"\t");
+		}
+		System.out.println();
+		for(int i=0;i<ddb.length;i++){
+			System.out.print(ddb[i]+"\t");
+		}*/
+		System.out.println();
+		System.out.println(content.length());
+		System.out.println(contentd.length());
+		String title = d.get(Configure.ITEM_TITLE);
+		String url = d.get(Configure.ITEM_URL);
+		String name="CRLZ"+docID+".txt";
+		File text=new File("D:\\RLZ\\",name);
+		if(text.exists()){text.delete();}
+		try {
+			text.createNewFile();
+		} catch (IOException e) {
+			// TODO Auto-generated catch block
+			e.printStackTrace();
+		}
+		FileWriter fw;
+		try {
+			fw = new FileWriter(text,true);
+			fw.append("CRLZ:"+content+'\n');
+			fw.append("original:"+contentd+'\n');
+			fw.append(title+'\n');
+			fw.append(url+'\n');
+		    fw.close();
+		} catch (IOException e) {
+			// TODO Auto-generated catch block
+			e.printStackTrace();
+		}		
+	}
+
+	//used for test RLZ
+		void testRLZ(int docID) throws IOException{
+			Document dd=null;
+			if(Configure.DocApi)dd=searcher.doc(docID);
+			else dd=getDocumentFromSSD(docID);
+			CompressedDocument cd=this.getCompressedDocumentFromSSD(docID);
+			Document d= this.decompressDocument(docID, cd);
+			String content = d.get(Configure.ITEM_CONTENT);
+			String contentd = dd.get(Configure.ITEM_CONTENT);
+			byte[]db=content.getBytes();
+			byte[]ddb=contentd.getBytes();
+			/*for(int i=0;i<db.length;i++){
+				System.out.print(db[i]+"\t");
+			}
+			System.out.println();
+			for(int i=0;i<ddb.length;i++){
+				System.out.print(ddb[i]+"\t");
+			}*/
+			System.out.println();
+			System.out.println(content.length());
+			System.out.println(contentd.length());
+			String title = d.get(Configure.ITEM_TITLE);
+			String url = d.get(Configure.ITEM_URL);
+			String name="RLZ"+docID+".txt";
+			File text=new File("D:\\RLZ\\",name);
+			if(text.exists()){text.delete();}
+			try {
+				text.createNewFile();
+			} catch (IOException e) {
+				// TODO Auto-generated catch block
+				e.printStackTrace();
+			}
+			FileWriter fw;
+			try {
+				fw = new FileWriter(text,true);
+				fw.append("RLZ:"+content+'\n');
+				fw.append("original:"+contentd+'\n');
+				fw.append(title+'\n');
+				fw.append(url+'\n');
+			    fw.close();
+			} catch (IOException e) {
+				// TODO Auto-generated catch block
+				e.printStackTrace();
+			}		
+		}
+	
+	// get the actual document by docID
+	// can add document cache
+	private Document getDocumentByID(int docID){
+		// check the document cache first
+		Document tempDoc = null;
+		
+//		if (this.docHitMap.get(docID) == null){
+//			this.docHitMap.put(docID, 1);
+//		} else {
+//			int x= this.docHitMap.get(docID);
+//			x ++;
+//			this.docHitMap.put(docID, x);
+//		}
+		
+		try{
+			if(Configure.RLZ){// use RLZ, this method is used for static caching
+				if(Configure.readRLZDoc){
+					if (inputParameters.documentCacheTurnOn  && inputParameters.memoryLimitMB() > 0)
+						tempDoc = this.documentCache.get(docID);
+					if(tempDoc==null){
+						double time=0;
+						if(Configure.Compressed){
+							CompressedRLZ crlz=null;
+							if(inputParameters.CRLZDocumentCacheTurnOn && inputParameters.memoryLimitMB() > 0)
+								crlz=this.CRLZDocumentCache.get(docID);
+							if(!this.isTrain&&Configure.hitedDocID&&crlz!=null)this.HitedDoID.append(docID+"\n");
+							if(crlz==null){
+								long t0 = System.nanoTime();
+								//	tempDoc = searcher.doc(docID);
+								crlz=this.getCompressedRLZ(docID);
+								long t1 = System.nanoTime();
+								time = (double)(t1 - t0)/1000000000.0f;
+								if(this.isTrain){
+									this.outputMeasurement.TimeofDocSSDIO+=time;		
+							    	this.outputMeasurement.CountOfDocIO++;
+							    	this.outputMeasurement.LengthOfDocumentIO+=RAMEstimator.INT_NUM_BYTE + RAMEstimator.getNumBytesOfCRLZDocument(crlz);
+						    	}
+								else{
+									//record missed docID
+									if(Configure.missedDocID)MissedDocID.append(docID+"\n");
+									this.outputMeasurement.TimeofDocSSDIOInTest+=time;
+									this.outputMeasurement.CountOfSSDIOInTest++;
+									this.outputMeasurement.LengthOfDocumentIOInTest+=RAMEstimator.INT_NUM_BYTE + RAMEstimator.getNumBytesOfCRLZDocument(crlz);
+								}
+								
+								assert crlz != null;
+								// update CRLZ document cache
+								// the cache key has 4 bytes
+								if (inputParameters.CRLZDocumentCacheTurnOn  && inputParameters.memoryLimitMB() > 0){
+									int tempNumBytes = RAMEstimator.INT_NUM_BYTE + RAMEstimator.getNumBytesOfCRLZDocument(crlz);
+									CacheNode<Integer, CompressedRLZ> tempNode = new CacheNode<Integer, CompressedRLZ>(docID, crlz, tempNumBytes);
+									tempNode.cost = time;
+									this.CRLZDocumentCache.put(tempNode);
+									tempNode=null;
+								}
+							}
+							long t0 = System.nanoTime();
+							tempDoc=this.decompressDocumentFromCRLZ(docID, crlz);
+							long t1 = System.nanoTime();
+							time = (double)(t1 - t0)/1000000000.0f;
+							if(this.isTrain)this.outputMeasurement.TimeOfDecompress+=time;
+							else{
+								this.outputMeasurement.CountOfDecompressedInTest++;
+								this.outputMeasurement.TimeOfDecompressInTest+=time;
+							}
+						}
+						else{
+							CompressedDocument cd = null;
+							if(inputParameters.RLZDocumentCacheTurnOn && inputParameters.memoryLimitMB() > 0)
+								cd=this.RLZDocumentCache.get(docID);
+							if(!this.isTrain&&Configure.hitedDocID&&cd!=null)this.HitedDoID.append(docID+"\n");
+							//cache miss
+							if(cd==null){
+								long t0 = System.nanoTime();
+							//	tempDoc = searcher.doc(docID);
+								cd=this.getCompressedDocumentFromSSD(docID);
+								long t1 = System.nanoTime();
+								time = (double)(t1 - t0)/1000000000.0f;
+								if(this.isTrain){
+									this.outputMeasurement.TimeofDocSSDIO+=time;		
+							    	this.outputMeasurement.CountOfDocIO++;
+							    	this.outputMeasurement.LengthOfDocumentIO+=RAMEstimator.INT_NUM_BYTE + RAMEstimator.getNumBytesOfRLZDocument(cd);
+						    	}
+								else{
+									//record missed docID
+									if(Configure.missedDocID)MissedDocID.append(docID+"\n");
+									this.outputMeasurement.TimeofDocSSDIOInTest+=time;
+									this.outputMeasurement.CountOfSSDIOInTest++;
+									this.outputMeasurement.LengthOfDocumentIOInTest+=RAMEstimator.INT_NUM_BYTE + RAMEstimator.getNumBytesOfRLZDocument(cd);
+								}
+								
+								assert cd != null;
+								
+								// update RLZ document cache
+								// the cache key has 4 bytes
+								if (inputParameters.RLZDocumentCacheTurnOn  && inputParameters.memoryLimitMB() > 0){
+									int tempNumBytes = RAMEstimator.INT_NUM_BYTE + RAMEstimator.getNumBytesOfRLZDocument(cd);
+									CacheNode<Integer, CompressedDocument> tempNode = new CacheNode<Integer, CompressedDocument>(docID, cd, tempNumBytes);
+									tempNode.cost = time;
+									this.RLZDocumentCache.put(tempNode);
+									tempNode=null;
+								}
+							}
+							long t0 = System.nanoTime();
+							tempDoc=this.decompressDocument(docID, cd);
+							long t1 = System.nanoTime();
+							time = (double)(t1 - t0)/1000000000.0f;
+							if(this.isTrain)this.outputMeasurement.TimeOfDecompress+=time;
+							else{
+								this.outputMeasurement.CountOfDecompressedInTest++;
+								this.outputMeasurement.TimeOfDecompressInTest+=time;
+							}
+						}
+						// update document cache
+						// the cache key has 4 bytes
+						if (inputParameters.documentCacheTurnOn  && inputParameters.memoryLimitMB() > 0){
+							int tempNumBytes = RAMEstimator.INT_NUM_BYTE + RAMEstimator.getNumBytesOfDocument(tempDoc);
+							CacheNode<Integer, Document> tempNode = new CacheNode<Integer, Document>(docID, tempDoc, tempNumBytes);
+							tempNode.cost = time;
+							this.documentCache.put(tempNode);
+							tempNode=null;
+						}
+					}
+				}
+				else{
+					if(this.isTrain){
+						if(Configure.Compressed){
+							if (inputParameters.documentCacheTurnOn  && inputParameters.memoryLimitMB() > 0)
+								tempDoc = this.documentCache.get(docID);
+							if(tempDoc==null){
+								CompressedRLZ cd = null;
+								if(inputParameters.CRLZDocumentCacheTurnOn && inputParameters.memoryLimitMB() > 0)
+									cd=this.CRLZDocumentCache.get(docID);
+								//cache miss
+								if(cd==null){
+									long t0 = System.nanoTime();
+								//	tempDoc = searcher.doc(docID);
+									cd=this.getCompressedRLZ(docID);
+									long t1 = System.nanoTime();
+									double time = (double)(t1 - t0)/1000000000.0f;
+									this.outputMeasurement.TimeofDocSSDIO+=time;
+									this.outputMeasurement.CountOfDocIO++;
+									this.outputMeasurement.LengthOfDocumentIO+=RAMEstimator.INT_NUM_BYTE + RAMEstimator.getNumBytesOfCRLZDocument(cd);
+								
+									
+									assert cd != null;
+									
+									// update RLZ document cache
+									// the cache key has 4 bytes
+									if (inputParameters.CRLZDocumentCacheTurnOn  && inputParameters.memoryLimitMB() > 0){
+										int tempNumBytes = RAMEstimator.INT_NUM_BYTE + RAMEstimator.getNumBytesOfCRLZDocument(cd);
+										CacheNode<Integer, CompressedRLZ> tempNode = new CacheNode<Integer, CompressedRLZ>(docID, cd, tempNumBytes);
+										tempNode.cost = time;
+										this.CRLZDocumentCache.put(tempNode);
+										tempNode=null;
+									}
+								}
+								long t0 = System.nanoTime();
+								tempDoc=this.decompressDocumentFromCRLZ(docID, cd);
+								long t1 = System.nanoTime();
+								double time = (double)(t1 - t0)/1000000000.0f;
+								this.outputMeasurement.TimeOfDecompress+=time;
+								// update document cache
+								// the cache key has 4 bytes
+								if (inputParameters.documentCacheTurnOn  && inputParameters.memoryLimitMB() > 0){
+									int tempNumBytes = RAMEstimator.INT_NUM_BYTE + RAMEstimator.getNumBytesOfDocument(tempDoc);
+									CacheNode<Integer, Document> tempNode = new CacheNode<Integer, Document>(docID, tempDoc, tempNumBytes);
+									tempNode.cost = time;
+									this.documentCache.put(tempNode);
+									tempNode=null;
+								}
+							}
+						}
+						else{
+							if (inputParameters.documentCacheTurnOn  && inputParameters.memoryLimitMB() > 0)
+								tempDoc = this.documentCache.get(docID);
+							if(tempDoc==null){
+								CompressedDocument cd = null;
+								if(inputParameters.RLZDocumentCacheTurnOn && inputParameters.memoryLimitMB() > 0)
+									cd=this.RLZDocumentCache.get(docID);
+								//cache miss
+								if(cd==null){
+									long t0 = System.nanoTime();
+								//	tempDoc = searcher.doc(docID);
+									cd=this.getCompressedDocumentFromSSD(docID);
+									long t1 = System.nanoTime();
+									double time = (double)(t1 - t0)/1000000000.0f;
+									this.outputMeasurement.TimeofDocSSDIO+=time;
+									this.outputMeasurement.CountOfDocIO++;
+									this.outputMeasurement.LengthOfDocumentIO+=RAMEstimator.INT_NUM_BYTE + RAMEstimator.getNumBytesOfRLZDocument(cd);
+								
+									
+									assert cd != null;
+									
+									// update RLZ document cache
+									// the cache key has 4 bytes
+									if (inputParameters.RLZDocumentCacheTurnOn  && inputParameters.memoryLimitMB() > 0){
+										int tempNumBytes = RAMEstimator.INT_NUM_BYTE + RAMEstimator.getNumBytesOfRLZDocument(cd);
+										CacheNode<Integer, CompressedDocument> tempNode = new CacheNode<Integer, CompressedDocument>(docID, cd, tempNumBytes);
+										tempNode.cost = time;
+										this.RLZDocumentCache.put(tempNode);
+										tempNode=null;
+									}
+								}
+								long t0 = System.nanoTime();
+								tempDoc=this.decompressDocument(docID, cd);
+								long t1 = System.nanoTime();
+								double time = (double)(t1 - t0)/1000000000.0f;
+								this.outputMeasurement.TimeOfDecompress+=time;
+								// update document cache
+								// the cache key has 4 bytes
+								if (inputParameters.documentCacheTurnOn  && inputParameters.memoryLimitMB() > 0){
+									int tempNumBytes = RAMEstimator.INT_NUM_BYTE + RAMEstimator.getNumBytesOfDocument(tempDoc);
+									CacheNode<Integer, Document> tempNode = new CacheNode<Integer, Document>(docID, tempDoc, tempNumBytes);
+									tempNode.cost = time;
+									this.documentCache.put(tempNode);
+									tempNode=null;
+								}
+							}
+						}
+											
+					}
+					else{
+						if(Configure.Compressed){
+							CompressedRLZ cd = null;
+							if(inputParameters.CRLZDocumentCacheTurnOn && inputParameters.memoryLimitMB() > 0)
+								cd=this.CRLZDocumentCache.get(docID);
+							if(cd!=null){
+								if(Configure.hitedDocID)this.HitedDoID.append(docID+"\n");
+								long t0 = System.nanoTime();
+								tempDoc=this.decompressDocumentFromCRLZ(docID, cd);
+								long t1 = System.nanoTime();
+								double time = (double)(t1 - t0)/1000000000.0f;
+								this.outputMeasurement.CountOfDecompressedInTest++;
+								this.outputMeasurement.TimeOfDecompressInTest+=time;
+							}
+							else{
+								long t0 = System.nanoTime();
+								if(Configure.DocApi)tempDoc = searcher.doc(docID);
+								else tempDoc=getDocumentFromSSD(docID);
+								long t1 = System.nanoTime();
+								double time = (double)(t1 - t0)/1000000000.0f;
+								//record missed docID
+								if(Configure.missedDocID)MissedDocID.append(docID+"\n");
+								this.outputMeasurement.TimeofDocSSDIOInTest+=time;
+								this.outputMeasurement.CountOfSSDIOInTest++;
+								this.outputMeasurement.LengthOfDocumentIOInTest+=RAMEstimator.INT_NUM_BYTE + RAMEstimator.getNumBytesOfDocument(tempDoc);
+							}
+						}
+						else{
+							CompressedDocument cd = null;
+							if(inputParameters.RLZDocumentCacheTurnOn && inputParameters.memoryLimitMB() > 0)
+								cd=this.RLZDocumentCache.get(docID);
+							if(cd!=null){
+								if(Configure.hitedDocID)this.HitedDoID.append(docID+"\n");
+								long t0 = System.nanoTime();
+								tempDoc=this.decompressDocument(docID, cd);
+								long t1 = System.nanoTime();
+								double time = (double)(t1 - t0)/1000000000.0f;
+								this.outputMeasurement.CountOfDecompressedInTest++;
+								this.outputMeasurement.TimeOfDecompressInTest+=time;
+							}
+							else{
+								long t0 = System.nanoTime();
+								if(Configure.DocApi)tempDoc = searcher.doc(docID);
+								else tempDoc=getDocumentFromSSD(docID);
+								long t1 = System.nanoTime();
+								double time = (double)(t1 - t0)/1000000000.0f;
+								//record missed docID
+								if(Configure.missedDocID)MissedDocID.append(docID+"\n");
+								this.outputMeasurement.TimeofDocSSDIOInTest+=time;
+								this.outputMeasurement.CountOfSSDIOInTest++;
+								this.outputMeasurement.LengthOfDocumentIOInTest+=RAMEstimator.INT_NUM_BYTE + RAMEstimator.getNumBytesOfDocument(tempDoc);
+							}
+						}
+						
+					}
+				}
+				
+			}
+			else{//nomal document
+				if (inputParameters.documentCacheTurnOn  && inputParameters.memoryLimitMB() > 0)
+					tempDoc = this.documentCache.get(docID);
+				
+				// cache miss
+				if (tempDoc == null){
+					
+					
+					long t0 = System.nanoTime();
+					if(Configure.DocApi)tempDoc = searcher.doc(docID);
+					else tempDoc=getDocumentFromSSD(docID);
+					long t1 = System.nanoTime();
+					double time = (double)(t1 - t0)/1000000000.0f;
+					if(this.isTrain){
+						this.outputMeasurement.TimeofDocSSDIO+=time;
+						this.outputMeasurement.CountOfDocIO++;
+						this.outputMeasurement.LengthOfDocumentIO+=RAMEstimator.INT_NUM_BYTE + RAMEstimator.getNumBytesOfDocument(tempDoc);
+					}
+					else{
+						//record missed docID
+						if(Configure.missedDocID)MissedDocID.append(docID+"\n");
+						this.outputMeasurement.CountOfSSDIOInTest++;
+						this.outputMeasurement.TimeofDocSSDIOInTest+=time;
+						this.outputMeasurement.LengthOfDocumentIOInTest+=RAMEstimator.INT_NUM_BYTE + RAMEstimator.getNumBytesOfDocument(tempDoc);
+					}
+					
+					assert tempDoc != null;
+					
+					// update document cache
+					// the cache key has 4 bytes
+					if (inputParameters.documentCacheTurnOn  && inputParameters.memoryLimitMB() > 0){
+						int tempNumBytes = RAMEstimator.INT_NUM_BYTE + RAMEstimator.getNumBytesOfDocument(tempDoc);
+						CacheNode<Integer, Document> tempNode = new CacheNode<Integer, Document>(docID, tempDoc, tempNumBytes);
+						tempNode.cost = time;
+						this.documentCache.put(tempNode);
+						tempNode=null;
+					}
+				}
+			}			
+		}catch(Exception e){
+			e.printStackTrace();
+			return null;
+		}
+		 
+		return tempDoc;
+	}
+	
+	// generate the query-biased snippet cache key
+	private String generateQueryBiasedSnippetKey(Query query, int docID){
+			String key = query.toString() + "-" + String.valueOf(docID);
+			return key;
+	}
+	
+	// generate query biased snippet over a document
+	private Snippet generateSnippet(Document document, Query query){
+		Snippet retSnippet = new Snippet();
+		
+		String url = document.get(Configure.ITEM_URL);
+		String title = document.get(Configure.ITEM_TITLE);
+		
+		String content = document.get(Configure.ITEM_CONTENT);
+		
+		if (content == null || content.length() == 0){
+			if (url == null || url.length() == 0)	url = "";
+			if (title == null || title.length() == 0)	title = "";
+			content = url + "\t" + title;
+			if(content.length() == 0){
+				//retSnippet.setPosition(null);
+				retSnippet.setSummarization("");
+				retSnippet.setTitle("");
+				retSnippet.setUrl("");
+				return retSnippet;
+			}
+		}
+		
+		TokenStream tokenStream =
+		analyzer.tokenStream(Configure.ITEM_CONTENT, new StringReader(content)); // takes far less time
+		
+		QueryScorer scorer = new QueryScorer(query, Configure.ITEM_CONTENT);
+		Fragmenter fragmenter = new SimpleSpanFragmenter(scorer, 500);
+		Highlighter highlighter = new Highlighter(scorer);
+
+		highlighter.setTextFragmenter(fragmenter);
+		TextFragment tempSummarization ;
+		String result = "";
+		
+		try {
+			tempSummarization = highlighter.getBestFragment(tokenStream, content);
+		} catch (Exception e) {
+			tempSummarization = null; 
+			//System.out.println(e.toString());
+		}
+		
+		ArrayList fragTexts = new ArrayList();
+	    if ((tempSummarization != null) && (tempSummarization.getScore() > 0))
+	    {
+	        fragTexts.add(tempSummarization.toString());
+	    }
+	    result = (String) fragTexts.toString();
+		
+		retSnippet.setUrl(url);
+		retSnippet.setTitle(title);
+		retSnippet.setSummarization(result);
+//		retSnippet.setPosition(tempSummarization);
+		return retSnippet;
+	}
+	
+	private Frag generateFrag(Document document, Query query){
+		Frag retSnippet = new Frag();
+		
+/*		String url = document.get(Configure.ITEM_URL);
+		String title = document.get(Configure.ITEM_TITLE);
+*/		
+		String content = document.get(Configure.ITEM_CONTENT);
+		
+		if (content == null || content.length() == 0){
+//			if (url == null || url.length() == 0)	url = "";
+//			if (title == null || title.length() == 0)	title = "";
+//			content = url + "\t" + title;
+			if(content.length() == 0){
+				retSnippet.setPosition(null);
+//				retSnippet.setSummarization("");
+//				retSnippet.setTitle("");
+//				retSnippet.setUrl("");
+				return retSnippet;
+			}
+		}
+		
+		TokenStream tokenStream =
+		analyzer.tokenStream(Configure.ITEM_CONTENT, new StringReader(content)); // takes far less time
+		
+		QueryScorer scorer = new QueryScorer(query, Configure.ITEM_CONTENT);
+		Fragmenter fragmenter = new SimpleSpanFragmenter(scorer, 500);
+		Highlighter highlighter = new Highlighter(scorer);
+
+		highlighter.setTextFragmenter(fragmenter);
+		TextFragment tempSummarization ;
+//		String tempSummarization;
+		
+		try {
+			tempSummarization = highlighter.getBestFragment(tokenStream, content);
+		} catch (Exception e) {
+			tempSummarization = null; 
+			//System.out.println(e.toString());
+		}
+//		retSnippet.setUrl(url);
+//		retSnippet.setTitle(title);
+//		retSnippet.setSummarization(tempSummarization);
+		retSnippet.setPosition(tempSummarization);
+		content=null;
+		tokenStream=null;
+		scorer=null;
+		fragmenter=null;
+		highlighter=null;
+		tempSummarization=null;
+		 
+		return retSnippet;
+	}
+	
+	private void outputResult(List<Snippet> topKResultSnippetList, String queryStr, Query innerQuery) throws IOException{
+		StringBuffer result=new StringBuffer();;
+		result.append("query string: " + queryStr+'\n');
+		result.append("inner query: " + innerQuery.toString()+'\n');
+		result.append("*************************************"+'\n');
+		
+		for (Snippet snippet: topKResultSnippetList){
+			result.append(snippet.getUrl()+'\n');
+			result.append(snippet.getTitle()+'\n');
+			result.append(snippet.getSummarization()+'\n');
+			result.append("*************************************"+'\n');
+		}
+		File f =new File("C:\\WebExperiments\\Results\\");
+		f.mkdir();
+		File f2 =new File("C:\\WebExperiments\\Results\\results.txt");
+		f2.createNewFile();
+		FileWriter write=new FileWriter(f2,true);
+		write.append(result);
+		write.close();
+	}
+	// display top-k results
+/*	private void display(List<Snippet> topKResultSnippetList, String queryStr, Query innerQuery){
+		System.out.println("query string: " + queryStr);
+		System.out.println("inner query: " + innerQuery.toString());
+		System.out.println("*************************************");
+		
+		for (Snippet snippet: topKResultSnippetList){
+			System.out.println(snippet.getUrl());
+			System.out.println(snippet.getTitle());
+			//String ss = getfullsnippet(snippet.getDocid(), snippet.getStart(),snippet.getEnd(),snippet.getfragstart(),snippet.getfragend());
+			//System.out.println(ss);
+//			System.out.println(snippet.getSummarization());
+			System.out.println("*************************************");
+		}
+		
+		System.out.println("\n\n\n");
+	}*/
+	
+
+	
+	// only one single type of cache exists
+	public static void section41(){
+		InputParameters inputParameters = new InputParameters();
+		
+		// specify cache strategies
+		Vector<String> cacheStrategyVector = new Vector<String>();
+		
+//		cacheStrategyVector.add(CacheStrategy.StaQTF);
+//		cacheStrategyVector.add(CacheStrategy.StaQTFDF);
+//		cacheStrategyVector.add(CacheStrategy.StaCA);
+//		cacheStrategyVector.add(CacheStrategy.LFU);
+//		cacheStrategyVector.add(CacheStrategy.DynQTFDF);
+		cacheStrategyVector.add(CacheStrategy.LRU);
+//		cacheStrategyVector.add(CacheStrategy.DynFB);
+//		cacheStrategyVector.add(CacheStrategy.DynCA);
+		
+		// specify cache types
+		Vector<String> cacheTypeVector = new Vector<String>();
+//		cacheTypeVector.add(Configure.QRC_RESULT_CACHE);	// query result cache
+		cacheTypeVector.add(Configure.SC_SNIPPET_CACHE);	// snippet cache
+//		cacheTypeVector.add(Configure.PLC_POSTINGLIST_CACHE);	// posting list cache
+//		cacheTypeVector.add(Configure.DC_DOCUMENT_CACHE);	// document cache
+		
+		// specify cache size, in MB
+		Vector<Double> memoryVectorMB = new Vector<Double>();	// MB
+		
+		// specify SSD/HDD
+		Vector<String> indexPathVector = new Vector<String>();
+		indexPathVector.add(Configure.SOUGOU_SSD_INDEX_DIRECTORY);
+//		indexPathVector.add(Configure.SOUGOU_HDD_INDEX_DIRECTORY);
+
+		int numOfCombinations = 0;
+		// enumerate every possible combination
+		for (int indexPath = 0; indexPath < indexPathVector.size(); indexPath ++){
+			String path = indexPathVector.elementAt(indexPath);
+			inputParameters.indexPath = path;
+			//used for RLZ
+			inputParameters.RLZDictionaryPath=Configure.SSD_RLZDictionaryPath;
+			
+			for (int indexCacheStrategy = 0; indexCacheStrategy < cacheStrategyVector.size(); indexCacheStrategy ++){
+				String cacheStrategy = cacheStrategyVector.elementAt(indexCacheStrategy);
+				
+				inputParameters.resetCacheStrategy();
+			
+				for (int indexCacheType = 0; indexCacheType < cacheTypeVector.size(); indexCacheType ++){
+					String cacheType = cacheTypeVector.elementAt(indexCacheType);
+					inputParameters.resetCacheType();
+					if (cacheType.equalsIgnoreCase(Configure.QRC_RESULT_CACHE))	{
+						
+						inputParameters.resultCacheTurnOn = true;
+						inputParameters.cacheStrategy_QRC = cacheStrategy;
+						// QRC
+						memoryVectorMB.clear();
+//						memoryVectorMB.add(0.0);
+//						memoryVectorMB.add(1.0);
+//						memoryVectorMB.add(4.0);
+//						memoryVectorMB.add(16.0);
+						memoryVectorMB.add(128.0);
+						memoryVectorMB.add(256.0);
+					}
+					else if (cacheType.equalsIgnoreCase(Configure.PLC_POSTINGLIST_CACHE)) {
+						inputParameters.postingListCacheTurnOn = true;
+						inputParameters.cacheStrategy_PLC = cacheStrategy;
+						// PLC
+						// set logscale x = 4
+						memoryVectorMB.clear();
+						
+						memoryVectorMB.add(16.0);
+						memoryVectorMB.add(64.0);
+						memoryVectorMB.add(256.0);
+						memoryVectorMB.add(512.0);
+//						memoryVectorMB.add(1024.0);
+//						memoryVectorMB.add(1024.0 * 2);
+//						memoryVectorMB.add(1024.0 * 3);
+//						memoryVectorMB.add(1024.0 * 4);
+						
+//						memoryVectorMB.add(32.0);
+//						memoryVectorMB.add(64.0);
+//						memoryVectorMB.add(128.0);
+//						memoryVectorMB.add(512.0 * 7);	
+						
+//						memoryVectorMB.add(512.0 * 1);	// 0.5GB
+//						memoryVectorMB.add(512.0 * 2);	// 1.0GB
+//						memoryVectorMB.add(512.0 * 3);	// 1.5GB
+//						memoryVectorMB.add(512.0 * 4);	// 2.0GB
+//						memoryVectorMB.add(512.0 * 5);	// 2.5GB
+//						memoryVectorMB.add(512.0 * 6);	// 3.0GB
+					}
+					else if (cacheType.equalsIgnoreCase(Configure.DC_DOCUMENT_CACHE)) {
+						inputParameters.documentCacheTurnOn = true;
+						inputParameters.cacheStrategy_DC = cacheStrategy;
+						// logscale x = 4
+						// DC
+						memoryVectorMB.clear();
+						memoryVectorMB.add(128.0);
+						memoryVectorMB.add(256.0);
+//						memoryVectorMB.add(2048.0);
+//						memoryVectorMB.add(3072.0);
+//						memoryVectorMB.add(4096.0);
+					}
+					else if (cacheType.equalsIgnoreCase(Configure.SC_SNIPPET_CACHE)) {
+						inputParameters.snippetCacheTurnOn = true;
+						inputParameters.cacheStrategy_SC = cacheStrategy;
+						// SC
+						// set logscale x = 4
+						memoryVectorMB.clear();
+						memoryVectorMB.add(0.25);
+//						memoryVectorMB.add(0.5);
+//						memoryVectorMB.add(1.0);
+//						memoryVectorMB.add(2.0);
+//						memoryVectorMB.add(4.0);
+//						memoryVectorMB.add(8.0);
+//						memoryVectorMB.add(16.0);
+//						memoryVectorMB.add(32.0);
+//						memoryVectorMB.add(64.0);
+//						memoryVectorMB.add(128.0);
+//						memoryVectorMB.add(256.0);
+//						memoryVectorMB.add(2048.0);
+//						memoryVectorMB.add(3072.0);
+//						memoryVectorMB.add(4096.0);
+					}
+					else {System.out.println("Wrong cache types specified! It can only from: QRC, PLC, DC and SC"); System.exit(0);}
+					
+					for (int indexCacheSize = 0; indexCacheSize < memoryVectorMB.size(); indexCacheSize ++){
+						double cacheSize = memoryVectorMB.elementAt(indexCacheSize);
+						if (cacheType.equalsIgnoreCase(Configure.QRC_RESULT_CACHE)) inputParameters.memoryLimitMB_QRC = cacheSize;
+						if (cacheType.equalsIgnoreCase(Configure.PLC_POSTINGLIST_CACHE)) inputParameters.memoryLimitMB_PLC = cacheSize;
+						if (cacheType.equalsIgnoreCase(Configure.SC_SNIPPET_CACHE)) inputParameters.memoryLimitMB_SC = cacheSize;
+						if (cacheType.equalsIgnoreCase(Configure.DC_DOCUMENT_CACHE)) inputParameters.memoryLimitMB_DC = cacheSize;
+						
+						Date   date   =   Calendar.getInstance().getTime(); 
+				        SimpleDateFormat   sdf   =   new   SimpleDateFormat( "yyyy/MM/dd HH:mm:ss"); 
+				        String   sDate   =   sdf.format(date);
+				        System.out.println(sDate);
+				        System.out.println((numOfCombinations + 1) + "-th / 4");
+						System.out.println(inputParameters.toString());
+						
+						Search obj = new Search(inputParameters);
+						obj.queryStartEntry();
+						
+						System.out.println("***********************\n\n");
+						numOfCombinations ++;
+					}
+				}
+			}
+		}
+		System.out.println("numOfCombinations: " + numOfCombinations);
+	}
+	
+	public static void section42(){
+		InputParameters inputParameters = new InputParameters();
+		
+		// specify cache types
+		Vector<String> cacheTypeVector = new Vector<String>();
+//		cacheTypeVector.add(Configure.QRC_RESULT_CACHE);	// query result cache
+		cacheTypeVector.add(Configure.PLC_POSTINGLIST_CACHE);	// posting list cache
+//		cacheTypeVector.add(Configure.DC_DOCUMENT_CACHE);	// document cache
+//		cacheTypeVector.add(Configure.SC_SNIPPET_CACHE);	// snippet cache
+		
+		// specify cache size
+		Vector<Double> memoryVectorMB = new Vector<Double>();
+		memoryVectorMB.add(1024.0);
+		memoryVectorMB.add(2048.0);
+		memoryVectorMB.add(3072.0);
+		memoryVectorMB.add(4096.0);
+		
+		int numOfCombinations = 0;
+		String path = Configure.SOUGOU_SSD_INDEX_DIRECTORY;
+		inputParameters.indexPath = path;
+		//used for RLZ
+		inputParameters.RLZDictionaryPath=Configure.SSD_RLZDictionaryPath;
+		
+		for (int indexCacheType = 0; indexCacheType < cacheTypeVector.size(); indexCacheType ++){
+			String cacheType = cacheTypeVector.elementAt(indexCacheType);
+			
+			String cacheStrategy = "";
+			inputParameters.resetCacheStrategy();
+			inputParameters.resetCacheType();
+			
+			if (cacheType.equalsIgnoreCase(Configure.QRC_RESULT_CACHE))	{
+				inputParameters.resultCacheTurnOn = true;
+				inputParameters.cacheStrategy_QRC = CacheStrategy.LRU;
+			}
+			else if (cacheType.equalsIgnoreCase(Configure.PLC_POSTINGLIST_CACHE)) {
+				inputParameters.postingListCacheTurnOn = true;
+				inputParameters.cacheStrategy_PLC = CacheStrategy.LFU;
+				
+				memoryVectorMB.clear();
+				memoryVectorMB.add(1024.0);
+				memoryVectorMB.add(256.0);
+				memoryVectorMB.add(64.0);
+				memoryVectorMB.add(16.0);
+				
+			}
+			else if (cacheType.equalsIgnoreCase(Configure.DC_DOCUMENT_CACHE)) {
+				inputParameters.documentCacheTurnOn = true;
+				inputParameters.cacheStrategy_DC = CacheStrategy.LRU;
+				
+				memoryVectorMB.clear();
+				memoryVectorMB.add(1024.0);
+				memoryVectorMB.add(256.0);
+				memoryVectorMB.add(64.0);
+				memoryVectorMB.add(16.0);
+				
+			}
+			else if (cacheType.equalsIgnoreCase(Configure.SC_SNIPPET_CACHE)) {
+				inputParameters.snippetCacheTurnOn = true;
+				inputParameters.cacheStrategy_SC = CacheStrategy.LRU;
+				
+				memoryVectorMB.clear();
+				memoryVectorMB.add(1024.0);
+				memoryVectorMB.add(256.0);
+				memoryVectorMB.add(64.0);
+				memoryVectorMB.add(16.0);
+			}
+			else {System.out.println("Wrong cache types specified! It can only from: QRC, PLC, DC and SC"); System.exit(0);}
+			
+			for (int indexCacheSize = 0; indexCacheSize < memoryVectorMB.size(); indexCacheSize ++){
+				double cacheSize = memoryVectorMB.elementAt(indexCacheSize);
+				inputParameters.resetCacheMemorySize();
+				if (cacheType.equalsIgnoreCase(Configure.QRC_RESULT_CACHE)) inputParameters.memoryLimitMB_QRC = cacheSize;
+				if (cacheType.equalsIgnoreCase(Configure.PLC_POSTINGLIST_CACHE)) inputParameters.memoryLimitMB_PLC = cacheSize;
+				if (cacheType.equalsIgnoreCase(Configure.SC_SNIPPET_CACHE)) inputParameters.memoryLimitMB_SC = cacheSize;
+				if (cacheType.equalsIgnoreCase(Configure.DC_DOCUMENT_CACHE)) inputParameters.memoryLimitMB_DC = cacheSize;
+				
+				Date   date   =   Calendar.getInstance().getTime(); 
+		        SimpleDateFormat   sdf   =   new   SimpleDateFormat( "yyyy/MM/dd HH:mm:ss"); 
+		        String   sDate   =   sdf.format(date);
+		        System.out.println(sDate);
+		        System.out.println((numOfCombinations + 1) + "-th");
+				System.out.println(inputParameters.toString());
+				
+//				Search obj = new Search(inputParameters);
+//				obj.queryStartEntry();
+				
+				System.out.println("***********************\n\n");
+				numOfCombinations ++;
+			}
+		}
+		System.out.println("numOfCombinations: " + numOfCombinations);
+	}
+	
+	// several caches co-exists
+	public static void section43(){
+
+		InputParameters inputParameters = new InputParameters();
+		
+		// un-changed
+		/*String cacheStrategy_QRC = CacheStrategy.LRU;
+		String cacheStrategy_PLC = CacheStrategy.LRU;
+		String cacheStrategy_DC = CacheStrategy.LRU;
+		String cacheStrategy_SC = CacheStrategy.LRU;
+		String cacheStrategy_FC = CacheStrategy.LRU;*/
+        Vector<String> cacheStrategyVector = new Vector<String>();
+		
+		cacheStrategyVector.add(CacheStrategy.StaQTF);
+//		cacheStrategyVector.add(CacheStrategy.StaQTFDF);
+//		cacheStrategyVector.add(CacheStrategy.StaCA);
+//		cacheStrategyVector.add(CacheStrategy.LFU);
+//		cacheStrategyVector.add(CacheStrategy.DynQTFDF);
+//		cacheStrategyVector.add(CacheStrategy.LRU);
+//		cacheStrategyVector.add(CacheStrategy.DynFB);
+//		cacheStrategyVector.add(CacheStrategy.DynCA);
+		
+		double memoryMB_QRC = 0;
+		double memoryMB_PLC = 0;
+		double memoryMB_SC = 0;
+		double memoryMB_DC = 0;
+		double memoryMB_RLZDC = 0;
+		double memoryMB_CRLZDC = 0;
+		double memoryMB_FC = 0;
+		
+		Vector<Double> memoryVectorMB = new Vector<Double>();
+		//师兄需要改
+//		memoryVectorMB.add(0.0);
+//		memoryVectorMB.add(0.92);
+//		memoryVectorMB.add(0.2);
+//		memoryVectorMB.add(0.05);
+//		memoryVectorMB.add(0.1);
+//		memoryVectorMB.add(0.2);
+//		memoryVectorMB.add(0.4);
+//		memoryVectorMB.add(0.6);
+//		memoryVectorMB.add(0.8);
+//		memoryVectorMB.add(0.85);
+//		memoryVectorMB.add(0.9);
+//		memoryVectorMB.add(0.95);
+//		memoryVectorMB.add(1.0);
+//		memoryVectorMB.add(2.0);
+//		memoryVectorMB.add(4.0);
+//		memoryVectorMB.add(8.0);
+//		memoryVectorMB.add(16.0);
+//		memoryVectorMB.add(32.0);
+//		memoryVectorMB.add(18.0);
+//		memoryVectorMB.add(43.0);
+//		memoryVectorMB.add(88.0);
+//		memoryVectorMB.add(133.0);
+//		memoryVectorMB.add(178.0);
+//		memoryVectorMB.add(2.9);
+//		memoryVectorMB.add(5.7);
+//		memoryVectorMB.add(11.5);
+//		memoryVectorMB.add(17.5);
+//		memoryVectorMB.add(23.2);
+//		memoryVectorMB.add(29.0);
+		memoryVectorMB.add(9.0);
+//		memoryVectorMB.add(21.5);
+//		memoryVectorMB.add(44.0);
+//		memoryVectorMB.add(66.5);
+//		memoryVectorMB.add(89.0);
+		
+		
+		double totalCacheSizeMB = 256.0;	// MB
+		
+		int numOfCombinations = 0;
+
+		for (int indexCacheStrategy = 0; indexCacheStrategy < cacheStrategyVector.size(); indexCacheStrategy ++){
+			String cacheStrategy = cacheStrategyVector.elementAt(indexCacheStrategy);		
+			inputParameters.resetCacheStrategy();
+			System.out.println(cacheStrategy);
+			String cacheStrategy_QRC = CacheStrategy.LRU;
+			String cacheStrategy_PLC = cacheStrategy;
+			String cacheStrategy_DC = cacheStrategy;
+			String cacheStrategy_RLZDC = cacheStrategy;
+			String cacheStrategy_CRLZDC = cacheStrategy;
+			String cacheStrategy_SC = cacheStrategy;
+			String cacheStrategy_FC = cacheStrategy;
+			for (int i = 0; i < memoryVectorMB.size(); i ++){
+		//		double x = totalCacheSizeMB * memoryVectorMB.elementAt(i);
+		//		double y = totalCacheSizeMB - x;
+				double x=memoryVectorMB.elementAt(i);
+				memoryMB_QRC = 0;
+				memoryMB_PLC = 0;
+				if(Configure.RLZ){
+					if(Configure.Compressed){
+						memoryMB_SC = 0;
+						memoryMB_DC = 0;
+						memoryMB_RLZDC = 0;
+						memoryMB_CRLZDC = totalCacheSizeMB-128-x;
+						memoryMB_FC = x;
+					}
+					else{
+						memoryMB_SC = 0;
+						memoryMB_DC = 0;
+						memoryMB_RLZDC = totalCacheSizeMB-128-x;
+						memoryMB_CRLZDC = 0;
+						memoryMB_FC = x;
+					}					
+				}
+				else{
+					memoryMB_SC = 0;
+					memoryMB_DC = totalCacheSizeMB-x;
+					memoryMB_RLZDC = 0;
+					memoryMB_CRLZDC = 0;
+					memoryMB_FC = x;
+				}
+				
+//					memoryMB_QRC = x;
+//					memoryMB_PLC = y * 0.8;
+//					
+//					memoryMB_SC = y * 0.2 * 0.2;
+//					memoryMB_DC = y * 0.2 * 0.8;
+				
+				inputParameters = new InputParameters();
+				
+				boolean resultCacheTurnOn = false;	// enable the result cache
+				boolean postingListCacheTurnOn = false;
+				boolean documentCacheTurnOn = false;
+				boolean RLZDocumentCacheTurnOn = false;
+				boolean CRLZDocumentCacheTurnOn = false;
+				boolean snippetCacheTurnOn = false;
+				boolean fragCacheTurnOn = false;
+				
+				if (memoryMB_QRC > 0) resultCacheTurnOn = true;
+				if (memoryMB_PLC > 0) postingListCacheTurnOn = true;
+				if (memoryMB_SC > 0) snippetCacheTurnOn = true;
+				if (memoryMB_DC > 0) documentCacheTurnOn = true;
+				if (memoryMB_RLZDC > 0) RLZDocumentCacheTurnOn = true;
+				if (memoryMB_CRLZDC > 0) CRLZDocumentCacheTurnOn = true;
+				if (memoryMB_FC > 0) fragCacheTurnOn = true;
+				
+				if(Configure.isSSD)inputParameters.indexPath = Configure.SOUGOU_SSD_INDEX_DIRECTORY;
+				if(!Configure.isSSD)inputParameters.indexPath = Configure.SOUGOU_HDD_INDEX_DIRECTORY;
+				//used for RLZ
+				inputParameters.RLZDictionaryPath=Configure.SSD_RLZDictionaryPath;
+
+				inputParameters.resultCacheTurnOn = resultCacheTurnOn;
+				inputParameters.postingListCacheTurnOn = postingListCacheTurnOn;
+				inputParameters.snippetCacheTurnOn = snippetCacheTurnOn;
+				inputParameters.documentCacheTurnOn = documentCacheTurnOn;
+				inputParameters.RLZDocumentCacheTurnOn = RLZDocumentCacheTurnOn;
+				inputParameters.CRLZDocumentCacheTurnOn = CRLZDocumentCacheTurnOn;
+				inputParameters.fragCacheTurnOn = fragCacheTurnOn;
+				
+				inputParameters.memoryLimitMB_QRC = memoryMB_QRC;
+				inputParameters.memoryLimitMB_PLC = memoryMB_PLC;
+				inputParameters.memoryLimitMB_DC = memoryMB_DC;
+				inputParameters.memoryLimitMB_RLZDC = memoryMB_RLZDC;
+				inputParameters.memoryLimitMB_CRLZDC = memoryMB_CRLZDC;
+				inputParameters.memoryLimitMB_SC = memoryMB_SC;
+				inputParameters.memoryLimitMB_FC = memoryMB_FC;
+
+				inputParameters.cacheStrategy_QRC = cacheStrategy_QRC;
+				inputParameters.cacheStrategy_PLC = cacheStrategy_PLC;
+				inputParameters.cacheStrategy_DC = cacheStrategy_DC;
+				inputParameters.cacheStrategy_RLZDC = cacheStrategy_RLZDC;
+				inputParameters.cacheStrategy_CRLZDC = cacheStrategy_CRLZDC;
+				inputParameters.cacheStrategy_SC = cacheStrategy_SC;
+				inputParameters.cacheStrategy_FC = cacheStrategy_FC;
+				
+				Date   date   =   Calendar.getInstance().getTime(); 
+		        SimpleDateFormat   sdf   =   new   SimpleDateFormat( "yyyy/MM/dd HH:mm:ss"); 
+		        String   sDate   =   sdf.format(date);
+		        System.out.println(sDate);
+				System.out.println(inputParameters.toString());
+				System.out.println(Search.testtesttest(inputParameters));
+				numOfCombinations ++;
+//				System.out.println(numOfCombinations + ":");
+		        System.out.println((numOfCombinations) + "-th / 6");
+				
+				Search obj = new Search(inputParameters);
+				obj.queryStartEntry();
+				/*try {
+					obj.testArrayCopySpeed(6259040);
+				} catch (CorruptIndexException e) {
+					// TODO Auto-generated catch block
+					e.printStackTrace();
+				} catch (IOException e) {
+					// TODO Auto-generated catch block
+					e.printStackTrace();
+				}*/
+				/*try {
+				//	obj.testRLZ(9420560);
+					obj.testCRLZ(6834864);
+				} catch (IOException e) {
+					// TODO Auto-generated catch block
+					e.printStackTrace();
+				}
+			//	System.out.println(obj.RLZDirectiory.length);
+			//	System.out.println(obj.RLZDirectiory[268435456]);
+                catch (DataFormatException e) {
+					// TODO Auto-generated catch block
+					e.printStackTrace();
+				}*/
+				
+				System.out.println("************************************\n\n");
+			}
+		}
+		
+	}
+
+	
+	public static String testtesttest(InputParameters inputParameters){
+		
+		StringBuilder strBuilder = new StringBuilder();
+		
+//		String cacheType = "";
+//		if (inputParameters.resultCacheTurnOn)	cacheType += "QRC";
+//		if (inputParameters.postingListCacheTurnOn) cacheType += "PLC";
+//		if (inputParameters.documentCacheTurnOn)	cacheType += "DC";
+//		if (inputParameters.snippetCacheTurnOn)	cacheType += "SC";
+		
+		String cacheStrategy = inputParameters.getCacheStrategyForFileName();
+
+		String SSDHDD = inputParameters.isSSD()? "SSD": "HDD";
+		
+//		strBuilder.append(cacheType + "-");
+		strBuilder.append(cacheStrategy + "-");
+		strBuilder.append(SSDHDD + ".txt");
+		
+		return strBuilder.toString();
+	}
+	
+	public static void main(String args[]){
+//		section41();
+//		section42();
+		section43();
+		System.out.println(getCurrentTime());
+	}
+}
+
+/**
+ * 
+ * 
+		CacheUtils utils = new CacheUtils();
+		utils.genQTFDF_CA_Files();
+		
+		
+		InputParameters inputParameters = new InputParameters();
+		
+		// specify cache strategies
+		Vector<String> cacheStrategyVector = new Vector<String>();
+		cacheStrategyVector.add(CacheStrategy.StaQTF);
+		cacheStrategyVector.add(CacheStrategy.StaQTFDF);
+		cacheStrategyVector.add(CacheStrategy.StaCA);
+		cacheStrategyVector.add(CacheStrategy.LRU);
+		cacheStrategyVector.add(CacheStrategy.DynQTFDF);
+		cacheStrategyVector.add(CacheStrategy.DynCA);
+		
+		// specify cache types
+		Vector<String> cacheTypeVector = new Vector<String>();
+		cacheTypeVector.add(Configure.QRC_RESULT_CACHE);	// query result cache
+		cacheTypeVector.add(Configure.PLC_POSTINGLIST_CACHE);	// posting list cache
+		cacheTypeVector.add(Configure.DC_DOCUMENT_CACHE);	// document cache
+		cacheTypeVector.add(Configure.SC_SNIPPET_CACHE);	// snippet cache
+		
+		// specify cache size
+		Vector<Double> memoryVectorMB = new Vector<Double>();
+
+		// specify SSD/HDD
+		Vector<String> indexPathVector = new Vector<String>();
+		indexPathVector.add(Configure.SOUGOU_SSD_INDEX_DIRECTORY);
+//		indexPathVector.add(Configure.SOUGOU_HDD_INDEX_DIRECTORY);
+
+		int numOfCombinations = 0;
+		// enumerate every possible combination
+		for (int indexPath = 0; indexPath < indexPathVector.size(); indexPath ++){
+			String path = indexPathVector.elementAt(indexPath);
+			inputParameters.indexPath = path;
+			
+			for (int indexCacheStrategy = 0; indexCacheStrategy < cacheStrategyVector.size(); indexCacheStrategy ++){
+				String cacheStrategy = cacheStrategyVector.elementAt(indexCacheStrategy);
+				inputParameters.cacheStrategy = cacheStrategy;
+			
+				for (int indexCacheType = 0; indexCacheType < cacheTypeVector.size(); indexCacheType ++){
+					String cacheType = cacheTypeVector.elementAt(indexCacheType);
+					
+					if (cacheType.equalsIgnoreCase(Configure.QRC_RESULT_CACHE))	{
+						
+						inputParameters.setResultCacheOnly();
+						// QRC
+						memoryVectorMB.clear();
+//						memoryVectorMB.add(0.0);
+						memoryVectorMB.add(0.001);
+						memoryVectorMB.add(0.01);
+						memoryVectorMB.add(0.1);
+						memoryVectorMB.add(1.0);
+					}
+					else if (cacheType.equalsIgnoreCase(Configure.PLC_POSTINGLIST_CACHE)) {
+						inputParameters.setPostingListCacheOnly();
+						// PLC
+						// set logscale x = 4
+						memoryVectorMB.clear();
+						memoryVectorMB.add(16.0);
+						memoryVectorMB.add(64.0);
+						memoryVectorMB.add(256.0);
+						memoryVectorMB.add(512.0);
+						memoryVectorMB.add(1024.0);
+					}
+					else if (cacheType.equalsIgnoreCase(Configure.DC_DOCUMENT_CACHE)) {
+						inputParameters.setDocumentCacheOnly();
+						// logscale x = 4
+						// DC
+						memoryVectorMB.clear();
+						memoryVectorMB.add(4.0);
+						memoryVectorMB.add(64.0);
+						memoryVectorMB.add(256.0);
+						memoryVectorMB.add(512.0);
+						memoryVectorMB.add(1024.0);
+					}
+					else if (cacheType.equalsIgnoreCase(Configure.SC_SNIPPET_CACHE)) {
+						inputParameters.setSnippetCacheOnly();
+						// SC
+						// set logscale x = 4
+						memoryVectorMB.clear();
+						memoryVectorMB.add(4.0);
+						memoryVectorMB.add(16.0);
+						memoryVectorMB.add(32.0);
+						memoryVectorMB.add(64.0);
+					}
+					else {System.out.println("Wrong cache types specified! It can only from: QRC, PLC, DC and SC"); System.exit(0);}
+					
+					for (int indexCacheSize = 0; indexCacheSize < memoryVectorMB.size(); indexCacheSize ++){
+						double cacheSize = memoryVectorMB.elementAt(indexCacheSize);
+						inputParameters.memoryLimitMB = cacheSize;
+						
+						Date   date   =   Calendar.getInstance().getTime(); 
+				        SimpleDateFormat   sdf   =   new   SimpleDateFormat( "yyyy/MM/dd HH:mm:ss"); 
+				        String   sDate   =   sdf.format(date);
+				        System.out.println(sDate);
+				        System.out.println((numOfCombinations + 1) + "-th");
+						System.out.println(inputParameters.toString());
+						
+						Search obj = new Search(inputParameters);
+						obj.queryStartEntry();
+						
+						System.out.println("***********************\n\n");
+						numOfCombinations ++;
+					}
+				}
+			}
+		}
+		
+		
+		System.out.println("numOfCombinations: " + numOfCombinations);
+	
+ */
